@@ -32,6 +32,10 @@ PHONE, OTP, ASK_TAG, ASK_SEARCH = range(4)
 
 executor = ThreadPoolExecutor(max_workers=30)
 
+# قفل‌های سراسری برای جلوگیری از تداخل عملیات‌های سنگین و صف‌بندی چند فایل زیپ
+zip_queue_lock = asyncio.Lock()
+refresh_task_lock = asyncio.Lock()
+
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
@@ -152,6 +156,49 @@ def get_user_id_from_token(token):
     data = decode_jwt_payload(token)
     return data.get('cerberusId') or data.get('alternativeCustomerId') or data.get('userId')
 
+def extract_tokens_from_json_data(data: dict):
+    """استخراج دقیق access_token، refresh_token و شماره موبایل از ساختار JSON فایل زیپ"""
+    access_token, refresh_token, mobile = None, None, None
+
+    for cookie in data.get('cookies', []):
+        c_name = cookie.get('name')
+        c_val = cookie.get('value')
+        if c_name in ['tokenMS', 'token'] and c_val and not access_token:
+            access_token = c_val
+        elif c_name == 'refresh_token' and c_val and not refresh_token:
+            refresh_token = c_val
+
+    for origin in data.get('origins', []):
+        for item in origin.get('localStorage', []):
+            i_name = item.get('name')
+            i_val = item.get('value')
+            if i_name == 'tokenMS' and i_val and not access_token:
+                access_token = i_val
+            elif i_name == 'refresh_token' and i_val and not refresh_token:
+                refresh_token = i_val
+            elif i_name == 'user' and i_val and not mobile:
+                try:
+                    u_obj = json.loads(urllib.parse.unquote(i_val))
+                    mobile = u_obj.get('mobilePhone') or u_obj.get('userName')
+                except Exception:
+                    pass
+            elif i_name == 'persist:root' and i_val and not access_token:
+                try:
+                    p_root = json.loads(i_val)
+                    u_outer = json.loads(p_root.get('user', '{}'))
+                    u_inner = u_outer.get('user', {})
+                    if isinstance(u_inner, dict):
+                        access_token = access_token or u_inner.get('token')
+                        mobile = mobile or u_inner.get('mobilePhone')
+                except Exception:
+                    pass
+
+    if not mobile and access_token:
+        jwt_d = decode_jwt_payload(access_token)
+        mobile = jwt_d.get('mobilePhone') or jwt_d.get('userName')
+
+    return access_token, refresh_token, clean_digits(str(mobile)) if mobile else None
+
 def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
     """بروزرسانی کامل توکن‌ها در تمامی بخش‌های JSON لینک (کوکی‌ها، localStorage و persist:root)"""
     try:
@@ -165,11 +212,20 @@ def update_tokens_in_data(data, old_acc, new_acc, old_ref, new_ref):
         updated = json.loads(content)
 
         if "cookies" in updated and isinstance(updated["cookies"], list):
+            found_acc = False
+            found_ref = False
             for c in updated["cookies"]:
                 if c.get("name") in ["tokenMS", "token"] and new_acc:
                     c["value"] = new_acc
+                    found_acc = True
                 elif c.get("name") == "refresh_token" and new_ref:
                     c["value"] = new_ref
+                    found_ref = True
+            if new_acc and not found_acc:
+                updated["cookies"].append({"name": "tokenMS", "value": new_acc, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
+                updated["cookies"].append({"name": "token", "value": new_acc, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
+            if new_ref and not found_ref:
+                updated["cookies"].append({"name": "refresh_token", "value": new_ref, "domain": ".okala.com", "path": "/", "secure": True, "sameSite": "None"})
 
         for origin in updated.get("origins", []):
             for item in origin.get("localStorage", []):
@@ -316,6 +372,45 @@ class OkalaAPI:
 
         return "proxy_error", None, None, last_status, last_resp
 
+    def check_access_token_alive(self, access_token, start_proxy_idx=0):
+        """تست مستقیم سلامت Access Token از طریق سرور اکالا"""
+        if not access_token:
+            return "dead", 401, "No access token"
+        proxy_dict = get_proxy_by_index(self.proxies_list, start_proxy_idx)
+        status, resp = self.get_addresses_api(access_token, proxy_dict=proxy_dict, fast_mode=True)
+        if status == 200:
+            return "alive", 200, resp
+        elif status in [400, 401]:
+            return "dead", status, resp
+        return "proxy_error", status, resp
+
+    def verify_and_renew_account(self, access_token, refresh_token, start_proxy_idx=0):
+        """
+        بررسی همزمان Refresh و Access:
+        ۱. ابتدا تلاش برای رفرش کردن تا توکن و رفرش‌توکن جدید بگیرد و هرگز منقضی نشود.
+        ۲. اگر رفرش‌توکن باطل بود، تست مستقیم Access Token فعلی.
+        خروجی: (result_type, final_acc, final_ref, status_code, raw_resp)
+        result_type: 'refreshed' | 'access_only' | 'unrecoverable' | 'proxy_error'
+        """
+        last_status, last_resp = 0, "Empty tokens"
+
+        if refresh_token:
+            r_state, new_acc, new_ref, r_status, r_resp = self.refresh_token_sequential_proxy(refresh_token, start_proxy_idx)
+            last_status, last_resp = r_status, r_resp
+            if r_state == "success" and new_acc:
+                return "refreshed", new_acc, (new_ref or refresh_token), 200, r_resp
+            elif r_state == "proxy_error" and not access_token:
+                return "proxy_error", None, None, r_status, r_resp
+
+        if access_token:
+            a_state, a_status, a_resp = self.check_access_token_alive(access_token, start_proxy_idx)
+            if a_state == "alive":
+                return "access_only", access_token, (refresh_token or ""), 200, a_resp
+            elif a_state == "proxy_error":
+                return "proxy_error", None, None, a_status, a_resp
+
+        return "unrecoverable", None, None, last_status, last_resp
+
     def check_discount_api(self, token, uid, proxy_dict=None, fast_mode=True):
         url = f"https://apigateway.okala.com/api/discount/v1/discounts/customer/{uid}"
         return self.make_request('GET', url, access_token=token, proxy_dict=proxy_dict, fast_mode=fast_mode)
@@ -389,7 +484,7 @@ def format_for_injector(auth_data):
     uid_val = user_info.get("Id") or jwt_data.get("userId") or 0
     alt_id = user_info.get("AlternativeId") or jwt_data.get("cerberusId") or ""
     alt_cust_id = user_info.get("AlternativeCustomerId") or jwt_data.get("alternativeCustomerId") or 0
-    mobile = user_info.get("MobilePhone") or jwt_data.get("mobilePhone") or ""
+    mobile = clean_digits(str(user_info.get("MobilePhone") or jwt_data.get("mobilePhone") or ""))
     
     user_dict = {
         "id": uid_val,
@@ -441,231 +536,285 @@ def format_for_injector(auth_data):
     }
 
 # ==========================================
-# نوسازی تمام توکن‌ها، احیای دائمی لینک‌ها و شناسایی اکانت‌های سوخته
+# نوسازی تمام توکن‌ها، احیای دائمی لینک‌ها و چرخش خودکار پس‌زمینه
 # ==========================================
-async def process_refresh_and_revive_all(bot, chat_id, acc_keys):
-    loop = asyncio.get_running_loop()
-    proxies_list = await get_all_proxies_from_db()
-    api = OkalaAPI(proxies_list=proxies_list)
-    ts = int(time.time())
+async def process_refresh_and_revive_all(bot, chat_id, acc_keys, is_auto_cycle=False):
+    if refresh_task_lock.locked():
+        if not is_auto_cycle:
+            await bot.send_message(chat_id=chat_id, text="⚠️ یک عملیات نوسازی هم‌اکنون در حال اجراست. لطفاً تا پایان آن صبر کنید.")
+        return
 
-    if not proxies_list:
-        await bot.send_message(
+    async with refresh_task_lock:
+        loop = asyncio.get_running_loop()
+        proxies_list = await get_all_proxies_from_db()
+        api = OkalaAPI(proxies_list=proxies_list)
+        ts = int(time.time())
+
+        if not proxies_list and not is_auto_cycle:
+            await bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ <b>هیچ پروکسی‌ای در سیستم ثبت نشده است!</b>\n"
+                     "عملیات بدون پروکسی ادامه می‌یابد اما توصیه می‌شود ابتدا پروکسی تنظیم کنید.",
+                parse_mode='HTML'
+            )
+
+        phone_to_link_id = {}
+        raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
+        for item in raw_logs:
+            try:
+                entry = json.loads(item)
+                p = clean_digits(str(entry.get('phone', '')))
+                l_url = entry.get('link', '')
+                if p and '/acc/' in l_url:
+                    phone_to_link_id[p] = l_url.split('/acc/')[-1].strip()
+            except Exception:
+                pass
+
+        existing_link_keys = await redis_client.keys("acc_link:*")
+        for l_key in existing_link_keys:
+            try:
+                lid = l_key.replace("acc_link:", "")
+                l_data = await redis_client.get(l_key)
+                if l_data:
+                    d_json = json.loads(l_data)
+                    origins = d_json.get("origins", [])
+                    if origins:
+                        for item in origins[0].get("localStorage", []):
+                            if item.get("name") == "user":
+                                u_obj = json.loads(urllib.parse.unquote(item.get("value")))
+                                p = clean_digits(str(u_obj.get("mobilePhone", "")))
+                                if p:
+                                    phone_to_link_id[p] = lid
+                                break
+            except Exception:
+                pass
+
+        total = len(acc_keys)
+        title_prefix = "⏱ [چرخش خودکار دوره‌ای]" if is_auto_cycle else "♻️"
+        progress_msg = await bot.send_message(
             chat_id=chat_id,
-            text="⚠️ <b>هیچ پروکسی‌ای در سیستم ثبت نشده است!</b>\n"
-                 "عملیات بدون پروکسی ادامه می‌یابد اما توصیه می‌شود ابتدا پروکسی تنظیم کنید.",
+            text=f"{title_prefix} شروع نوسازی توکن‌ها و ذخیره آخرین Access/Refresh برای <b>{total}</b> اکانت...\n⏳ لطفاً منتظر بمانید.",
             parse_mode='HTML'
         )
 
-    phone_to_link_id = {}
-    raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
-    for item in raw_logs:
-        try:
-            entry = json.loads(item)
-            p = entry.get('phone')
-            l_url = entry.get('link', '')
-            if p and '/acc/' in l_url:
-                phone_to_link_id[p] = l_url.split('/acc/')[-1].strip()
-        except Exception:
-            pass
+        detail_logs = []
+        active_links_list = []
+        unrecoverable_phones = []
+        stats = {"updated": 0, "recreated": 0, "access_only": 0, "unrecoverable": 0, "proxy_error": 0}
+        done = 0
+        last_edit_time = 0
+        lock = asyncio.Lock()
+        sem = asyncio.Semaphore(20)
 
-    existing_link_keys = await redis_client.keys("acc_link:*")
-    for l_key in existing_link_keys:
-        try:
-            lid = l_key.replace("acc_link:", "")
-            l_data = await redis_client.get(l_key)
-            if l_data:
-                d_json = json.loads(l_data)
-                origins = d_json.get("origins", [])
-                if origins:
-                    for item in origins[0].get("localStorage", []):
-                        if item.get("name") == "user":
-                            u_obj = json.loads(urllib.parse.unquote(item.get("value")))
-                            p = u_obj.get("mobilePhone")
-                            if p:
-                                phone_to_link_id[p] = lid
-                            break
-        except Exception:
-            pass
+        async def _worker(idx, key):
+            nonlocal done, last_edit_time
+            raw_phone = key.replace("account:", "")
+            phone = clean_digits(raw_phone)
 
-    total = len(acc_keys)
-    progress_msg = await bot.send_message(
-        chat_id=chat_id,
-        text=f"♻️ شروع بررسی دیتابیس، نوسازی توکن‌ها و تولید دائمی لینک‌ها برای <b>{total}</b> اکانت...\n⏳ لطفاً منتظر بمانید.",
-        parse_mode='HTML'
-    )
+            async with sem:
+                try:
+                    token_data = await redis_client.hgetall(key)
+                    old_acc = token_data.get("access_token", "")
+                    old_ref = token_data.get("refresh_token", "")
 
-    detail_logs = []
-    active_links_list = []
-    unrecoverable_phones = []
-    stats = {"updated": 0, "recreated": 0, "unrecoverable": 0, "proxy_error": 0}
-    done = 0
-    last_edit_time = 0
-    lock = asyncio.Lock()
-    sem = asyncio.Semaphore(20)
+                    # اگر کلید قبلی با اعداد فارسی بود، به کلید استاندارد انگلیسی منتقل شود
+                    if raw_phone != phone and phone:
+                        await redis_client.hset(f"account:{phone}", mapping={"access_token": old_acc, "refresh_token": old_ref})
+                        await redis_client.delete(key)
+                        key = f"account:{phone}"
 
-    async def _worker(idx, key):
-        nonlocal done, last_edit_time
-        phone = key.replace("account:", "")
-        async with sem:
-            try:
-                token_data = await redis_client.hgetall(key)
-                old_acc = token_data.get("access_token", "")
-                old_ref = token_data.get("refresh_token", "")
+                    if not old_ref and not old_acc:
+                        async with lock:
+                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ {phone} | فاقد هرگونه توکن (غیرقابل بازگشت)\n")
+                            stats["unrecoverable"] += 1
+                            unrecoverable_phones.append(raw_phone)
+                            done += 1
+                        return
 
-                if not old_ref:
-                    async with lock:
-                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ {phone} | فاقد refresh_token (غیرقابل بازگشت)\n")
-                        stats["unrecoverable"] += 1
-                        unrecoverable_phones.append(phone)
-                        done += 1
-                    return
+                    res_type, final_acc, final_ref, status_code, raw_resp = await loop.run_in_executor(
+                        executor, api.verify_and_renew_account, old_acc, old_ref, idx
+                    )
 
-                state, new_acc, new_ref, status_code, raw_resp = await loop.run_in_executor(
-                    executor, api.refresh_token_sequential_proxy, old_ref, idx
-                )
+                    if res_type in ["refreshed", "access_only"] and final_acc:
+                        # ذخیره آخرین Access و Refresh در دیتابیس
+                        await redis_client.hset(key, mapping={"access_token": final_acc, "refresh_token": final_ref or ""})
 
-                if state == "success" and new_acc:
-                    final_ref = new_ref or old_ref
-                    await redis_client.hset(key, mapping={"access_token": new_acc, "refresh_token": final_ref})
-
-                    link_id = phone_to_link_id.get(phone)
-                    if not link_id:
-                        active_url = await redis_client.get(f"phone_active_link:{phone}")
-                        if active_url and '/acc/' in active_url:
-                            link_id = active_url.split('/acc/')[-1].strip()
-
-                    link_recreated = False
-                    if link_id and await redis_client.exists(f"acc_link:{link_id}"):
-                        old_link_str = await redis_client.get(f"acc_link:{link_id}")
-                        updated_data = update_tokens_in_data(old_link_str, old_acc, new_acc, old_ref, final_ref)
-                        await redis_client.set(f"acc_link:{link_id}", json.dumps(updated_data, ensure_ascii=False))
-                    else:
+                        link_id = phone_to_link_id.get(phone)
                         if not link_id:
-                            link_id = str(uuid.uuid4())[:12]
-                        auth_data = {
-                            "access_token": new_acc,
-                            "refresh_token": final_ref,
-                            "UserInfo": {"MobilePhone": phone, "HasName": True}
-                        }
-                        injection_json = format_for_injector(auth_data)
-                        await redis_client.set(f"acc_link:{link_id}", json.dumps(injection_json, ensure_ascii=False))
-                        link_recreated = True
+                            active_url = await redis_client.get(f"phone_active_link:{phone}") or await redis_client.get(f"phone_active_link:{raw_phone}")
+                            if active_url and '/acc/' in active_url:
+                                link_id = active_url.split('/acc/')[-1].strip()
 
-                    final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                    await redis_client.set(f"phone_active_link:{phone}", final_url)
-
-                    async with lock:
-                        if link_recreated:
-                            stats["recreated"] += 1
-                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🆕 {phone} | توکن نوسازی شد + لینک دائمی مجدداً تولید شد: {final_url}\n")
+                        link_recreated = False
+                        if link_id and await redis_client.exists(f"acc_link:{link_id}"):
+                            old_link_str = await redis_client.get(f"acc_link:{link_id}")
+                            updated_data = update_tokens_in_data(old_link_str, old_acc, final_acc, old_ref, final_ref)
+                            await redis_client.set(f"acc_link:{link_id}", json.dumps(updated_data, ensure_ascii=False))
                         else:
-                            stats["updated"] += 1
-                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ {phone} | توکن نوسازی شد + لینک دائمی آپدیت شد: {final_url}\n")
-                        active_links_list.append({"phone": phone, "link": final_url})
+                            if not link_id:
+                                link_id = str(uuid.uuid4())[:12]
+                            auth_data = {
+                                "access_token": final_acc,
+                                "refresh_token": final_ref or "",
+                                "UserInfo": {"MobilePhone": phone, "HasName": True}
+                            }
+                            injection_json = format_for_injector(auth_data)
+                            await redis_client.set(f"acc_link:{link_id}", json.dumps(injection_json, ensure_ascii=False))
+                            link_recreated = True
 
-                elif state == "unrecoverable":
+                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                        await redis_client.set(f"phone_active_link:{phone}", final_url)
+
+                        async with lock:
+                            if res_type == "access_only":
+                                stats["access_only"] += 1
+                                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🟢 {phone} | رفرش‌توکن نامعتبر بود اما Access Token فعال است: {final_url}\n")
+                            elif link_recreated:
+                                stats["recreated"] += 1
+                                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🆕 {phone} | توکن چرخش یافت + لینک دائمی مجدداً تولید شد: {final_url}\n")
+                            else:
+                                stats["updated"] += 1
+                                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ {phone} | آخرین Access و Refresh ذخیره و لینک آپدیت شد: {final_url}\n")
+                            active_links_list.append({"phone": phone, "link": final_url})
+
+                    elif res_type == "unrecoverable":
+                        async with lock:
+                            stats["unrecoverable"] += 1
+                            unrecoverable_phones.append(phone)
+                            if raw_phone != phone:
+                                unrecoverable_phones.append(raw_phone)
+                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 💀 {phone} | غیرقابل بازگشت (کد: {status_code}) | پاسخ: {str(raw_resp)[:200]}\n")
+
+                    else:
+                        async with lock:
+                            stats["proxy_error"] += 1
+                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} | خطای شبکه/پروکسی پس از چرخش پروکسی‌ها (کد: {status_code})\n")
+
                     async with lock:
-                        stats["unrecoverable"] += 1
-                        unrecoverable_phones.append(phone)
-                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 💀 {phone} | غیرقابل بازگشت (کد: {status_code}) | پاسخ: {str(raw_resp)[:200]}\n")
+                        done += 1
+                        now = time.time()
+                        if (now - last_edit_time >= 2.5) or (done == total):
+                            last_edit_time = now
+                            try:
+                                await progress_msg.edit_text(
+                                    f"{title_prefix} <b>در حال چرخش توکن‌ها و احیای دائمی لینک‌ها...</b>\n"
+                                    f"📊 پیشرفت: <b>{done}/{total}</b>\n"
+                                    f"✅ رفرش و آپدیت کامل (Access+Refresh): <b>{stats['updated']}</b>\n"
+                                    f"🆕 تولید مجدد لینک حذف‌شده: <b>{stats['recreated']}</b>\n"
+                                    f"🟢 فعال فقط با Access Token: <b>{stats['access_only']}</b>\n"
+                                    f"💀 غیرقابل بازگشت (هر دو باطل): <b>{stats['unrecoverable']}</b>\n"
+                                    f"⚠️ خطای پروکسی/شبکه: <b>{stats['proxy_error']}</b>",
+                                    parse_mode='HTML'
+                                )
+                            except Exception:
+                                pass
 
-                else:
+                except Exception as e:
                     async with lock:
                         stats["proxy_error"] += 1
-                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} | خطای شبکه/پروکسی پس از چرخش پروکسی‌ها (کد: {status_code})\n")
+                        done += 1
+                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای غیرمنتظره برای {phone}: {e}\n")
 
-                async with lock:
-                    done += 1
-                    now = time.time()
-                    if (now - last_edit_time >= 2.0) or (done == total):
-                        last_edit_time = now
-                        try:
-                            await progress_msg.edit_text(
-                                f"♻️ <b>در حال نوسازی توکن‌ها و احیای دائمی لینک‌ها...</b>\n"
-                                f"📊 پیشرفت: <b>{done}/{total}</b>\n"
-                                f"✅ نوسازی و آپدیت لینک: <b>{stats['updated']}</b>\n"
-                                f"🆕 تولید مجدد لینک حذف‌شده: <b>{stats['recreated']}</b>\n"
-                                f"💀 غیرقابل بازگشت (توکن باطل): <b>{stats['unrecoverable']}</b>\n"
-                                f"⚠️ خطای پروکسی/شبکه: <b>{stats['proxy_error']}</b>",
-                                parse_mode='HTML'
-                            )
-                        except Exception:
-                            pass
+        await asyncio.gather(*[_worker(i, k) for i, k in enumerate(acc_keys)])
 
-            except Exception as e:
-                async with lock:
-                    stats["proxy_error"] += 1
-                    done += 1
-                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای غیرمنتظره برای {phone}: {e}\n")
+        await redis_client.set("settings:last_auto_refresh", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-    await asyncio.gather(*[_worker(i, k) for i, k in enumerate(acc_keys)])
+        try:
+            await progress_msg.delete()
+        except Exception:
+            pass
 
-    try:
-        await progress_msg.delete()
-    except Exception:
-        pass
+        await redis_client.delete("temp:unrecoverable_accounts")
+        if unrecoverable_phones:
+            await redis_client.sadd("temp:unrecoverable_accounts", *unrecoverable_phones)
 
-    await redis_client.delete("temp:unrecoverable_accounts")
-    if unrecoverable_phones:
-        await redis_client.sadd("temp:unrecoverable_accounts", *unrecoverable_phones)
+        if active_links_list:
+            links_txt = f"🔗 لیست لینک‌های دائمی با توکن نوسازی‌شده (تعداد: {len(active_links_list)})\n" + "=" * 50 + "\n\n"
+            for idx, item in enumerate(active_links_list, 1):
+                links_txt += f"{idx}. 📱 شماره: {item['phone']}\n🔗 {item['link']}\n\n"
+            links_io = io.BytesIO(links_txt.encode('utf-8'))
+            await bot.send_document(
+                chat_id=chat_id,
+                document=links_io,
+                filename=f"Permanent_Refreshed_Links_{ts}.txt",
+                caption=f"✅ فایل لینک‌های دائمی و نوسازی‌شده ({len(active_links_list)} اکانت فعال)"
+            )
 
-    if active_links_list:
-        links_txt = f"🔗 لیست لینک‌های دائمی با توکن نوسازی‌شده (تعداد: {len(active_links_list)})\n" + "=" * 50 + "\n\n"
-        for idx, item in enumerate(active_links_list, 1):
-            links_txt += f"{idx}. 📱 شماره: {item['phone']}\n🔗 {item['link']}\n\n"
-        links_io = io.BytesIO(links_txt.encode('utf-8'))
-        await bot.send_document(
-            chat_id=chat_id,
-            document=links_io,
-            filename=f"Permanent_Refreshed_Links_{ts}.txt",
-            caption=f"✅ فایل لینک‌های دائمی و نوسازی‌شده ({len(active_links_list)} اکانت فعال)"
+        try:
+            full_log = f"=== گزارش کامل نوسازی توکن‌ها و احیای لینک‌ها | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+            full_log += (
+                f"کل اکانت‌ها: {total} | آپدیت‌شده: {stats['updated']} | لینک مجدد: {stats['recreated']} | "
+                f"فعال با Access: {stats['access_only']} | غیرقابل بازگشت: {stats['unrecoverable']} | خطای پروکسی: {stats['proxy_error']}\n"
+            )
+            full_log += "=" * 60 + "\n\n"
+            full_log += "=== خلاصه وضعیت تک‌تک شماره‌ها ===\n"
+            full_log += "".join(detail_logs)
+            full_log += "\n\n=== لاگ کامل درخواست‌ها و پاسخ‌های سرور (HTTP Requests) ===\n"
+            full_log += "".join(api.request_logs)
+
+            log_io = io.BytesIO(full_log.encode('utf-8'))
+            await bot.send_document(
+                chat_id=chat_id,
+                document=log_io,
+                filename=f"Refresh_All_Requests_Log_{ts}.txt",
+                caption="📄 گزارش کامل تمامی درخواست‌ها و پاسخ‌های دریافتی از سرور"
+            )
+        except Exception as e:
+            logging.error(f"Error sending refresh full log: {e}")
+
+        summary_text = (
+            f"✅ <b>عملیات چرخش توکن‌ها و ذخیره آخرین Access/Refresh پایان یافت.</b>\n\n"
+            f"👥 <b>کل اکانت‌های بررسی شده:</b> <code>{total}</code>\n"
+            f"♻️ <b>نوسازی کامل (Access + Refresh جدید):</b> <code>{stats['updated']}</code>\n"
+            f"🆕 <b>تولید مجدد لینک دائمی حذف‌شده:</b> <code>{stats['recreated']}</code>\n"
+            f"🟢 <b>سالم فقط با Access Token فعلی:</b> <code>{stats['access_only']}</code>\n"
+            f"⚠️ <b>خطای شبکه/پروکسی (بدون تغییر):</b> <code>{stats['proxy_error']}</code>\n"
+            f"💀 <b>اکانت‌های غیرقابل بازگشت (هر دو توکن باطل):</b> <code>{stats['unrecoverable']}</code>\n"
         )
 
-    try:
-        full_log = f"=== گزارش کامل نوسازی توکن‌ها و احیای لینک‌ها | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-        full_log += (
-            f"کل اکانت‌ها: {total} | آپدیت‌شده: {stats['updated']} | لینک مجدد تولیدشده: {stats['recreated']} | "
-            f"غیرقابل بازگشت: {stats['unrecoverable']} | خطای پروکسی: {stats['proxy_error']}\n"
-        )
-        full_log += "=" * 60 + "\n\n"
-        full_log += "=== خلاصه وضعیت تک‌تک شماره‌ها ===\n"
-        full_log += "".join(detail_logs)
-        full_log += "\n\n=== لاگ کامل درخواست‌ها و پاسخ‌های سرور (HTTP Requests) ===\n"
-        full_log += "".join(api.request_logs)
+        if unrecoverable_phones:
+            unique_dead_count = len(set(clean_digits(p) for p in unrecoverable_phones))
+            summary_text += (
+                f"\n❓ <b>آیا مایلید <code>{unique_dead_count}</code> اکانت غیرقابل بازگشت به طور کامل از دیتابیس حذف شوند؟</b>"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🗑 بله، حذف {unique_dead_count} اکانت سوخته", callback_data="admin_confirm_delete_dead")],
+                [InlineKeyboardButton("❌ خیر، نادیده بگیر", callback_data="admin_cancel_delete_dead")],
+                [InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]
+            ])
+        else:
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]])
 
-        log_io = io.BytesIO(full_log.encode('utf-8'))
-        await bot.send_document(
-            chat_id=chat_id,
-            document=log_io,
-            filename=f"Refresh_All_Requests_Log_{ts}.txt",
-            caption="📄 گزارش کامل تمامی درخواست‌ها و پاسخ‌های دریافتی از سرور"
-        )
-    except Exception as e:
-        logging.error(f"Error sending refresh full log: {e}")
+        await bot.send_message(chat_id=chat_id, text=summary_text, reply_markup=kb, parse_mode='HTML')
 
-    summary_text = (
-        f"✅ <b>عملیات بررسی دیتابیس و نوسازی توکن‌ها پایان یافت.</b>\n\n"
-        f"👥 <b>کل اکانت‌های بررسی شده:</b> <code>{total}</code>\n"
-        f"♻️ <b>توکن نوسازی و لینک دائمی آپدیت شد:</b> <code>{stats['updated']}</code>\n"
-        f"🆕 <b>لینک حذف‌شده مجدداً به صورت دائمی تولید شد:</b> <code>{stats['recreated']}</code>\n"
-        f"⚠️ <b>خطای شبکه/پروکسی (بدون تغییر):</b> <code>{stats['proxy_error']}</code>\n"
-        f"💀 <b>اکانت‌های غیرقابل بازگشت (توکن باطل):</b> <code>{stats['unrecoverable']}</code>\n"
-    )
+async def auto_refresh_background_task(bot):
+    """وظیفه پس‌زمینه برای چرخش خودکار رفرش‌توکن‌ها جهت جلوگیری از انقضای اکانت‌ها"""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            interval_str = await redis_client.get("settings:auto_refresh_interval")
+            # پیش‌فرض: هر ۱۲ ساعت (۴۳۲۰۰ ثانیه)
+            interval = int(interval_str) if (interval_str and interval_str.isdigit()) else 43200
 
-    if unrecoverable_phones:
-        summary_text += (
-            f"\n❓ <b>آیا مایلید <code>{len(unrecoverable_phones)}</code> اکانت غیرقابل بازگشت به طور کامل از دیتابیس حذف شوند؟</b>"
-        )
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🗑 بله، حذف {len(unrecoverable_phones)} اکانت سوخته", callback_data="admin_confirm_delete_dead")],
-            [InlineKeyboardButton("❌ خیر، نادیده بگیر", callback_data="admin_cancel_delete_dead")],
-            [InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]
-        ])
-    else:
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]])
+            if interval <= 0:
+                await asyncio.sleep(60)
+                continue
 
-    await bot.send_message(chat_id=chat_id, text=summary_text, reply_markup=kb, parse_mode='HTML')
+            last_ts_str = await redis_client.get("settings:last_auto_refresh_ts")
+            last_ts = int(last_ts_str) if (last_ts_str and last_ts_str.isdigit()) else 0
+            now = int(time.time())
+
+            if now - last_ts >= interval:
+                await redis_client.set("settings:last_auto_refresh_ts", str(now))
+                acc_keys = await redis_client.keys("account:*")
+                if acc_keys and ADMIN_IDS:
+                    target_admin = ADMIN_IDS[0]
+                    await process_refresh_and_revive_all(bot, target_admin, acc_keys, is_auto_cycle=True)
+
+            await asyncio.sleep(60)
+        except Exception as e:
+            logging.error(f"Auto refresh loop error: {e}")
+            await asyncio.sleep(60)
 
 # ==========================================
 # استخراج پرسرعت اکانت‌های خام (بدون خرید و بدون آدرس)
@@ -689,7 +838,7 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
     for item in raw_logs:
         try:
             entry = json.loads(item)
-            phone_to_latest_link[entry['phone']] = entry['link']
+            phone_to_latest_link[clean_digits(str(entry.get('phone', '')))] = entry['link']
         except:
             pass
 
@@ -749,7 +898,7 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
 
     async def _worker(idx, key):
         nonlocal done, last_edit_time
-        phone = key.replace("account:", "")
+        phone = clean_digits(key.replace("account:", ""))
         async with sem:
             try:
                 token_data = await redis_client.hgetall(key)
@@ -773,7 +922,7 @@ async def process_raw_accounts_and_send_report(bot, chat_id, acc_keys):
                 if new_acc:
                     access_token = new_acc
                     refresh_token = new_ref or refresh_token
-                    await redis_client.hset(key, mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                    await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
 
                 link = None
                 if result_state == "raw":
@@ -895,7 +1044,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
     for item in raw_logs:
         try:
             entry = json.loads(item)
-            phone_to_latest_link[entry['phone']] = entry['link']
+            phone_to_latest_link[clean_digits(str(entry.get('phone', '')))] = entry['link']
         except:
             pass
 
@@ -945,7 +1094,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
 
     async def _worker(idx, key):
         nonlocal done, last_edit_time
-        phone = key.replace("account:", "")
+        phone = clean_digits(key.replace("account:", ""))
         async with sem:
             try:
                 token_data = await redis_client.hgetall(key)
@@ -976,7 +1125,7 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
                 if new_acc:
                     access_token = new_acc
                     refresh_token = new_ref or refresh_token
-                    await redis_client.hset(key, mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
+                    await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
 
                 old_link = phone_to_latest_link.get(phone) or await redis_client.get(f"phone_active_link:{phone}") or ""
 
@@ -1080,125 +1229,237 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         logging.error(f"Error sending log file: {e}")
 
 # ==========================================
-# پردازش فایل زیپ (با تولید لینک دائمی)
+# پردازش فایل‌های زیپ (با تست سلامت Access و Refresh + صف خودکار چند فایل)
 # ==========================================
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id): return
     
-    file_name = update.message.document.file_name.lower()
-    if not file_name.endswith('.zip'):
+    orig_zip_name = update.message.document.file_name or "file.zip"
+    if not orig_zip_name.lower().endswith('.zip'):
         await update.message.reply_text("❌ فایل ارسالی نامعتبر است. لطفاً فایل زیپ (.zip) ارسال کنید.")
         return
         
     action = context.user_data.get('admin_zip_action', 'zip_to_link')
-    msg = await update.message.reply_text("⏳ در حال دریافت و استخراج فایل...")
-    
-    new_file = await update.message.document.get_file()
-    
-    with tempfile.TemporaryDirectory() as temp_dir:
-        zip_path = os.path.join(temp_dir, "uploaded.zip")
-        await new_file.download_to_drive(zip_path)
-        
-        extracted_dir = os.path.join(temp_dir, "extracted")
-        await asyncio.to_thread(shutil.unpack_archive, zip_path, extracted_dir)
-        
-        json_files_paths = []
-        for root, dirs, files in os.walk(extracted_dir):
-            for file in files:
-                if file.lower().endswith('.json'):
-                    json_files_paths.append(os.path.join(root, file))
-                    
-        if not json_files_paths:
-            await msg.edit_text("⚠️ هیچ فایل JSON معتبری در فایل زیپ یافت نشد.")
-            return
+    wait_msg = await update.message.reply_text(
+        f"📥 فایل <code>{html.escape(orig_zip_name)}</code> دریافت شد و در صف پردازش قرار گرفت...",
+        parse_mode='HTML'
+    )
 
-        if action == 'zip_to_link':
-            links_text = "<b>لیست لینک‌های دائمی تولید شده:</b>\n\n"
-            count = 0
-            for file_path in json_files_paths:
-                filename = os.path.basename(file_path)
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        file_content = f.read()
-                        data = json.loads(file_content)
-                        access_token, refresh_token = None, None
-                        for cookie in data.get('cookies', []):
-                            if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                            elif cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                        if not access_token:
-                            for origin in data.get('origins', []):
-                                for item in origin.get('localStorage', []):
-                                    if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                    elif item.get('name') == 'refresh_token': refresh_token = item.get('value')
-                        phone = filename.replace('.json', '')
-                        if access_token:
-                            await redis_client.hset(f"account:{phone}", mapping={"access_token": access_token, "refresh_token": refresh_token or ""})
-                        link_id = str(uuid.uuid4())[:12]
-                        await redis_client.set(f"acc_link:{link_id}", file_content)
-                        final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                        await redis_client.set(f"phone_active_link:{phone}", final_url)
-                        links_text += f"📱 <b>شماره {phone}:</b>\n{final_url}\n\n"
-                        count += 1
-                except Exception:
-                    pass
-            if len(links_text) > 4000:
-                clean_links = re.sub(r'<[^>]+>', '', links_text)
-                file_out = io.BytesIO(clean_links.encode('utf-8'))
-                await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Links_{int(time.time())}.txt", caption=f"✅ استخراج {count} اکانت به صورت دائمی انجام شد.")
-                await msg.delete()
-            else:
-                await msg.edit_text(f"✅ <b>تعداد {count} اکانت به صورت دائمی ذخیره شد:</b>\n\n{links_text}", disable_web_page_preview=True, parse_mode='HTML')
+    # صف‌بندی خودکار در صورت ارسال همزمان چندین فایل زیپ
+    async with zip_queue_lock:
+        try:
+            await wait_msg.edit_text(f"⏳ در حال دانلود و استخراج فایل <code>{html.escape(orig_zip_name)}</code>...", parse_mode='HTML')
+        except Exception:
+            pass
 
-        elif action == 'zip_discount_check':
-            await msg.edit_text(f"⚡ در حال بررسی موازی وضعیت تخفیف {len(json_files_paths)} فایل...")
-            discount_dir = os.path.join(temp_dir, "Discount_Accounts")
-            os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
-            links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
-            discount_count = 0
+        new_file = await update.message.document.get_file()
+        ts = int(time.time())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, "uploaded.zip")
+            await new_file.download_to_drive(zip_path)
             
+            extracted_dir = os.path.join(temp_dir, "extracted")
+            await asyncio.to_thread(shutil.unpack_archive, zip_path, extracted_dir)
+            
+            json_files_paths = []
+            for root, dirs, files in os.walk(extracted_dir):
+                for file in files:
+                    if file.lower().endswith('.json'):
+                        json_files_paths.append(os.path.join(root, file))
+                        
+            if not json_files_paths:
+                await wait_msg.edit_text(f"⚠️ هیچ فایل JSON معتبری در فایل <code>{html.escape(orig_zip_name)}</code> یافت نشد.", parse_mode='HTML')
+                return
+
+            total_files = len(json_files_paths)
             proxies_list = await get_all_proxies_from_db()
             api = OkalaAPI(proxies_list=proxies_list)
             loop = asyncio.get_running_loop()
             sem = asyncio.Semaphore(20)
             lock = asyncio.Lock()
 
-            raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
-            phone_to_latest_link = {}
-            for item in raw_logs:
+            if action == 'zip_to_link':
+                await wait_msg.edit_text(
+                    f"⚡ شروع بررسی سلامت Access و Refresh برای <b>{total_files}</b> اکانت داخل <code>{html.escape(orig_zip_name)}</code>...",
+                    parse_mode='HTML'
+                )
+
+                healthy_links = []
+                detail_logs = []
+                z_stats = {"refreshed": 0, "access_only": 0, "dead": 0, "proxy_error": 0}
+                done = 0
+                last_edit = 0
+
+                async def _zip_validate_worker(idx, file_path):
+                    nonlocal done, last_edit
+                    filename = os.path.basename(file_path)
+                    async with sem:
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                file_content = f.read()
+                                data = json.loads(file_content)
+
+                            acc_tok, ref_tok, extracted_phone = extract_tokens_from_json_data(data)
+                            phone = extracted_phone or clean_digits(filename.replace('.json', ''))
+
+                            if not acc_tok and not ref_tok:
+                                async with lock:
+                                    z_stats["dead"] += 1
+                                    done += 1
+                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ {phone} ({filename}) | فاقد Access و Refresh معتبر در فایل\n")
+                                return
+
+                            res_type, final_acc, final_ref, st_code, raw_resp = await loop.run_in_executor(
+                                executor, api.verify_and_renew_account, acc_tok, ref_tok, idx
+                            )
+
+                            if res_type in ["refreshed", "access_only"] and final_acc:
+                                # ذخیره آخرین Access و Refresh در دیتابیس
+                                await redis_client.hset(f"account:{phone}", mapping={
+                                    "access_token": final_acc,
+                                    "refresh_token": final_ref or ""
+                                })
+
+                                # بروزرسانی توکن‌ها داخل ساختار JSON لینک
+                                updated_json_data = update_tokens_in_data(data, acc_tok, final_acc, ref_tok, final_ref)
+                                updated_content_str = json.dumps(updated_json_data, ensure_ascii=False)
+
+                                existing_url = await redis_client.get(f"phone_active_link:{phone}")
+                                if existing_url and '/acc/' in existing_url:
+                                    link_id = existing_url.split('/acc/')[-1].strip()
+                                else:
+                                    link_id = str(uuid.uuid4())[:12]
+
+                                await redis_client.set(f"acc_link:{link_id}", updated_content_str)
+                                final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                                await redis_client.set(f"phone_active_link:{phone}", final_url)
+
+                                async with lock:
+                                    if res_type == "refreshed":
+                                        z_stats["refreshed"] += 1
+                                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ {phone} | رفرش موفق و لینک دائمی ساخته شد: {final_url}\n")
+                                    else:
+                                        z_stats["access_only"] += 1
+                                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🟢 {phone} | Access سالم و لینک دائمی ساخته شد: {final_url}\n")
+                                    healthy_links.append({"phone": phone, "link": final_url})
+
+                            elif res_type == "unrecoverable":
+                                async with lock:
+                                    z_stats["dead"] += 1
+                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 💀 {phone} | توکن‌ها باطل/منقضی (کد: {st_code}) — لینک ساخته نشد\n")
+                            else:
+                                async with lock:
+                                    z_stats["proxy_error"] += 1
+                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} | خطای شبکه/پروکسی (کد: {st_code})\n")
+
+                            async with lock:
+                                done += 1
+                                now = time.time()
+                                if (now - last_edit >= 2.0) or (done == total_files):
+                                    last_edit = now
+                                    try:
+                                        await wait_msg.edit_text(
+                                            f"📦 فایل: <code>{html.escape(orig_zip_name)}</code>\n"
+                                            f"📊 پیشرفت: <b>{done}/{total_files}</b>\n"
+                                            f"✅ سالم و نوسازی‌شده (Refresh+Access): <b>{z_stats['refreshed']}</b>\n"
+                                            f"🟢 سالم با Access فعلی: <b>{z_stats['access_only']}</b>\n"
+                                            f"💀 منقضی/باطل (رد شده): <b>{z_stats['dead']}</b>\n"
+                                            f"⚠️ خطای پروکسی: <b>{z_stats['proxy_error']}</b>",
+                                            parse_mode='HTML'
+                                        )
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            async with lock:
+                                z_stats["dead"] += 1
+                                done += 1
+                                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای خواندن {filename}: {e}\n")
+
+                await asyncio.gather(*[_zip_validate_worker(i, fp) for i, fp in enumerate(json_files_paths)])
+
                 try:
-                    entry = json.loads(item)
-                    phone_to_latest_link[entry['phone']] = entry['link']
-                except: pass
-            
-            def _check_sync_zip(acc_token, ref_token, uid, p_dict, idx):
-                status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict, fast_mode=True)
-                if status == 401 and ref_token:
-                    st, new_acc, new_ref, _, _ = api.refresh_token_sequential_proxy(ref_token, start_proxy_idx=idx)
-                    if st == "success" and new_acc:
-                        status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict, fast_mode=True)
-                        return status, res, new_acc, new_ref
-                return status, res, None, None
-            
-            async def _zip_worker(idx, file_path):
-                nonlocal discount_count, links_text
-                filename = os.path.basename(file_path)
-                async with sem:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
+
+                summary_cap = (
+                    f"📦 <b>نتیجه بررسی فایل زیپ:</b> <code>{html.escape(orig_zip_name)}</code>\n\n"
+                    f"🔢 <b>کل فایل‌های بررسی‌شده:</b> <code>{total_files}</code>\n"
+                    f"✅ <b>نوسازی‌شده (Access + Refresh جدید):</b> <code>{z_stats['refreshed']}</code>\n"
+                    f"🟢 <b>سالم فقط با Access Token:</b> <code>{z_stats['access_only']}</code>\n"
+                    f"🔗 <b>مجموع لینک‌های دائمی ساخته‌شده:</b> <code>{len(healthy_links)}</code>\n"
+                    f"💀 <b>رد شده (توکن باطل):</b> <code>{z_stats['dead']}</code>\n"
+                    f"⚠️ <b>خطای شبکه/پروکسی:</b> <code>{z_stats['proxy_error']}</code>"
+                )
+
+                if healthy_links:
+                    links_out_txt = f"🔗 لیست لینک‌های دائمی سالم استخراج‌شده از {orig_zip_name} (تعداد: {len(healthy_links)})\n" + "=" * 55 + "\n\n"
+                    for idx, item in enumerate(healthy_links, 1):
+                        links_out_txt += f"{idx}. 📱 شماره: {item['phone']}\n🔗 {item['link']}\n\n"
+                    file_out = io.BytesIO(links_out_txt.encode('utf-8'))
+                    await context.bot.send_document(
+                        chat_id=user_id,
+                        document=file_out,
+                        filename=f"Valid_Zip_Links_{ts}.txt",
+                        caption=summary_cap,
+                        parse_mode='HTML'
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=summary_cap + "\n\n⚠️ هیچ اکانت سالمی در این فایل زیپ یافت نشد.",
+                        parse_mode='HTML'
+                    )
+
+                # ارسال لاگ کامل بررسی فایل زیپ
+                full_zip_log = f"=== لاگ بررسی سلامت فایل زیپ ({orig_zip_name}) | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+                full_zip_log += "".join(detail_logs)
+                full_zip_log += "\n\n=== لاگ کامل درخواست‌های سرور ===\n"
+                full_zip_log += "".join(api.request_logs)
+                log_io = io.BytesIO(full_zip_log.encode('utf-8'))
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=log_io,
+                    filename=f"Zip_Validation_Log_{ts}.txt",
+                    caption=f"📄 لاگ کامل بررسی توکن‌های فایل {orig_zip_name}"
+                )
+
+            elif action == 'zip_discount_check':
+                await wait_msg.edit_text(f"⚡ در حال بررسی موازی وضعیت تخفیف {total_files} فایل در <code>{html.escape(orig_zip_name)}</code>...", parse_mode='HTML')
+                discount_dir = os.path.join(temp_dir, "Discount_Accounts")
+                os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
+                links_text = "<b>لیست لینک‌های دارای تخفیف:</b>\n\n"
+                discount_count = 0
+
+                raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
+                phone_to_latest_link = {}
+                for item in raw_logs:
                     try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            file_content = f.read()
-                            data = json.loads(file_content)
-                            access_token = None
-                            refresh_token = None
-                            phone = filename.replace('.json', '')
-                            for cookie in data.get('cookies', []):
-                                if cookie.get('name') == 'tokenMS': access_token = cookie.get('value')
-                                if cookie.get('name') == 'refresh_token': refresh_token = cookie.get('value')
-                            if not access_token:
-                                for origin in data.get('origins', []):
-                                    for item in origin.get('localStorage', []):
-                                        if item.get('name') == 'tokenMS': access_token = item.get('value')
-                                        if item.get('name') == 'refresh_token': refresh_token = item.get('value')
+                        entry = json.loads(item)
+                        phone_to_latest_link[clean_digits(str(entry.get('phone', '')))] = entry['link']
+                    except: pass
+                
+                def _check_sync_zip(acc_token, ref_token, uid, p_dict, idx):
+                    status, res = api.check_discount_api(acc_token, uid, proxy_dict=p_dict, fast_mode=True)
+                    if status == 401 and ref_token:
+                        st, new_acc, new_ref, _, _ = api.refresh_token_sequential_proxy(ref_token, start_proxy_idx=idx)
+                        if st == "success" and new_acc:
+                            status, res = api.check_discount_api(new_acc, uid, proxy_dict=p_dict, fast_mode=True)
+                            return status, res, new_acc, new_ref
+                    return status, res, None, None
+                
+                async def _zip_worker(idx, file_path):
+                    nonlocal discount_count, links_text
+                    filename = os.path.basename(file_path)
+                    async with sem:
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                file_content = f.read()
+                                data = json.loads(file_content)
+                            access_token, refresh_token, extr_phone = extract_tokens_from_json_data(data)
+                            phone = extr_phone or clean_digits(filename.replace('.json', ''))
                             
                             if access_token:
                                 user_uuid = get_user_id_from_token(access_token)
@@ -1209,7 +1470,9 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     )
                                     
                                     if new_acc:
-                                        data = update_tokens_in_data(data, access_token, new_acc, refresh_token, new_ref)
+                                        final_ref = new_ref or refresh_token
+                                        await redis_client.hset(f"account:{phone}", mapping={"access_token": new_acc, "refresh_token": final_ref or ""})
+                                        data = update_tokens_in_data(data, access_token, new_acc, refresh_token, final_ref)
                                         file_content = json.dumps(data, ensure_ascii=False)
                                         with open(file_path, 'w', encoding='utf-8') as fw:
                                             fw.write(file_content)
@@ -1227,31 +1490,31 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                                 discount_count += 1
                                                 shutil.copy2(file_path, os.path.join(discount_dir, 'accounts', filename))
                                                 links_text += f"📱 <b>شماره {phone}:</b>\n{old_link}\n\n"
-                    except Exception as e:
-                        async with lock:
-                            api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
+                        except Exception as e:
+                            async with lock:
+                                api.request_logs.append(f"[{filename}] Exception: {str(e)}\n{'-'*40}\n")
 
-            await asyncio.gather(*[_zip_worker(i, fp) for i, fp in enumerate(json_files_paths)])
-            debug_logs = api.request_logs
-            
-            if discount_count > 0:
-                discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
-                await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
-                await msg.delete()
-                with open(discount_zip_path + '.zip', 'rb') as zip_file:
-                    await context.bot.send_document(chat_id=user_id, document=zip_file, filename="Discounted_Accounts.zip", caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
-                if len(links_text) > 4000:
-                    clean_links = re.sub(r'<[^>]+>', '', links_text)
-                    file_out = io.BytesIO(clean_links.encode('utf-8'))
-                    await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Discount_Links_{int(time.time())}.txt", caption="🔗 لینک‌های دسترسی سریع")
-                else:
-                    await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
-            else:
-                await msg.edit_text("⚠️ هیچ‌یک از اکانت‌های موجود دارای تخفیف نبودند.")
+                await asyncio.gather(*[_zip_worker(i, fp) for i, fp in enumerate(json_files_paths)])
+                debug_logs = api.request_logs
                 
-            if debug_logs:
-                debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
-                await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{int(time.time())}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
+                if discount_count > 0:
+                    discount_zip_path = os.path.join(temp_dir, "Discounted_Accounts")
+                    await asyncio.to_thread(shutil.make_archive, discount_zip_path, 'zip', discount_dir)
+                    await wait_msg.delete()
+                    with open(discount_zip_path + '.zip', 'rb') as zip_file:
+                        await context.bot.send_document(chat_id=user_id, document=zip_file, filename=f"Discounted_{orig_zip_name}", caption=f"🎁 <b>فایل خروجی (فیلتر شده)</b>\nتعداد اکانت‌های دارای تخفیف: {discount_count}", parse_mode='HTML')
+                    if len(links_text) > 4000:
+                        clean_links = re.sub(r'<[^>]+>', '', links_text)
+                        file_out = io.BytesIO(clean_links.encode('utf-8'))
+                        await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Discount_Links_{ts}.txt", caption="🔗 لینک‌های دسترسی سریع")
+                    else:
+                        await context.bot.send_message(chat_id=user_id, text=links_text, disable_web_page_preview=True, parse_mode='HTML')
+                else:
+                    await wait_msg.edit_text(f"⚠️ هیچ‌یک از اکانت‌های موجود در <code>{html.escape(orig_zip_name)}</code> دارای تخفیف نبودند.", parse_mode='HTML')
+                    
+                if debug_logs:
+                    debug_out = io.BytesIO("".join(debug_logs).encode('utf-8'))
+                    await context.bot.send_document(chat_id=user_id, document=debug_out, filename=f"Discount_Debug_Log_{ts}.txt", caption="📄 فایل لاگ پاسخ درخواست‌های سرور")
 
 # ==========================================
 # مینی‌سرور وب
@@ -1294,9 +1557,10 @@ def get_admin_keyboard():
     keyboard = [
         [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("📋 گزارش لینک‌های کاربران", callback_data="admin_users_report")],
         [InlineKeyboardButton("♻️ نوسازی توکن‌ها و احیای دائمی لینک‌ها", callback_data="admin_refresh_and_revive")],
+        [InlineKeyboardButton("⏱ تنظیم چرخش خودکار توکن‌ها", callback_data="admin_auto_refresh_menu")],
         [InlineKeyboardButton("🧹 استخراج اکانت‌های خام (بدون خرید و آدرس)", callback_data="admin_extract_raw")],
         [InlineKeyboardButton("🎁 بررسی تخفیف دیتابیس", callback_data="admin_check_discounts"), InlineKeyboardButton("📂 تفکیک فایل تخفیف", callback_data="admin_split_discount_file")],
-        [InlineKeyboardButton("🔗 تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
+        [InlineKeyboardButton("🔗 تست و تبدیل زیپ به لینک", callback_data="admin_zip_to_link"), InlineKeyboardButton("🔍 بررسی تخفیف زیپ", callback_data="admin_zip_discount")],
         [InlineKeyboardButton("🔗 استخراج لینک‌ها", callback_data="admin_export_links"), InlineKeyboardButton("🔑 استخراج توکن‌ها", callback_data="admin_export_tokens")],
         [InlineKeyboardButton("📥 استخراج شماره‌ها", callback_data="admin_export"), InlineKeyboardButton("🗑 پاکسازی کل دیتابیس", callback_data="admin_clear")],
         [InlineKeyboardButton("🌐 تنظیم پروکسی", callback_data="admin_set_proxy"), InlineKeyboardButton("⏸ روشن/خاموش کردن", callback_data="admin_toggle")],
@@ -1375,7 +1639,7 @@ async def receive_tag_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     context.user_data['active_tag_name'] = tag_name
     
     await update.message.reply_text(
-        f"✅ برچسب <b>«{ html.escape(tag_name)}»</b> با موفقیت تنظیم شد.\nاکنون می‌توانید شروع به ساختن لینک کنید.", 
+        f"✅ برچسب <b>«{html.escape(tag_name)}»</b> با موفقیت تنظیم شد.\nاکنون می‌توانید شروع به ساختن لینک کنید.", 
         parse_mode='HTML', 
         reply_markup=get_main_keyboard(is_admin(update.effective_user.id), tag_name)
     )
@@ -1415,8 +1679,15 @@ async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYP
     for item in raw_logs:
         try:
             entry = json.loads(item)
-            phone_to_latest_link[entry['phone']] = entry['link']
+            phone_to_latest_link[clean_digits(str(entry.get('phone', '')))] = entry['link']
         except: pass
+
+    active_keys = await redis_client.keys("phone_active_link:*")
+    for ak in active_keys:
+        p = clean_digits(ak.replace("phone_active_link:", ""))
+        val = await redis_client.get(ak)
+        if p and val:
+            phone_to_latest_link[p] = val
         
     report_text = "🔍 <b>نتایج جستجوی شما:</b>\n\n"
     found_count = 0
@@ -1641,6 +1912,45 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['admin_zip_action'] = None
         await query.edit_message_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
         
+    elif data == "admin_auto_refresh_menu":
+        interval_str = await redis_client.get("settings:auto_refresh_interval")
+        interval = int(interval_str) if (interval_str and interval_str.isdigit()) else 43200
+        last_run = await redis_client.get("settings:last_auto_refresh") or "هنوز اجرا نشده"
+
+        if interval <= 0:
+            status_str = "غیرفعال 🔴"
+        else:
+            status_str = f"فعال 🟢 (هر {interval // 3600} ساعت یک‌بار)"
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("هر ۶ ساعت ⏱", callback_data="admin_set_autoref_21600"),
+                InlineKeyboardButton("هر ۱۲ ساعت 🕧", callback_data="admin_set_autoref_43200")
+            ],
+            [
+                InlineKeyboardButton("هر ۲۴ ساعت 📅", callback_data="admin_set_autoref_86400"),
+                InlineKeyboardButton("غیرفعال کردن 🔴", callback_data="admin_set_autoref_0")
+            ],
+            [InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]
+        ])
+        text = (
+            "⏱ <b>تنظیم چرخش خودکار رفرش‌توکن‌ها (Auto-Rotation):</b>\n\n"
+            f"📡 <b>وضعیت فعلی:</b> {status_str}\n"
+            f"🕒 <b>آخرین اجرای موفق:</b> <code>{last_run}</code>\n\n"
+            "💡 با فعال بودن این گزینه، ربات به صورت خودکار در پس‌زمینه تمام اکانت‌ها را نوسازی کرده و آخرین <code>Access</code> و <code>Refresh</code> را ذخیره می‌کند تا هرگز منقضی نشوند."
+        )
+        await query.edit_message_text(text, reply_markup=kb, parse_mode='HTML')
+
+    elif data.startswith("admin_set_autoref_"):
+        new_int = int(data.split("admin_set_autoref_")[1])
+        await redis_client.set("settings:auto_refresh_interval", str(new_int))
+        if new_int > 0:
+            await redis_client.set("settings:last_auto_refresh_ts", str(int(time.time())))
+            msg_txt = f"✅ چرخش خودکار توکن‌ها روی <b>هر {new_int // 3600} ساعت یک‌بار</b> تنظیم شد."
+        else:
+            msg_txt = "🔴 چرخش خودکار توکن‌ها غیرفعال شد."
+        await query.edit_message_text(msg_txt, reply_markup=get_admin_keyboard(), parse_mode='HTML')
+
     elif data == "admin_set_proxy":
         context.user_data['admin_state'] = 'waiting_for_proxy'
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]])
@@ -1658,7 +1968,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "📂 <b>تفکیک و دسته‌بندی فایل تخفیف بر اساس مبلغ:</b>\n\n"
             "لطفاً فایل متنی گزارش تخفیف‌ها (<code>Discounts_Report_...txt</code>) یا متن پیام گزارش را ارسال کنید.\n\n"
-            "🔹 ربات به صورت خودکار شماره‌ها را حذف کرده و لینک‌ها را بر اساس مبلغ تخفیف (مثلاً ۵۰ هزار تومانی، ۱۰۰ هزار تومانی و...) دسته‌بندی و ارسال می‌کند.",
+            "🔹 ربات به صورت خودکار شماره‌ها را حذف کرده و لینک‌ها را بر اساس مبلغ تخفیف دسته‌بندی و ارسال می‌کند.",
             reply_markup=kb,
             parse_mode='HTML'
         )
@@ -1670,6 +1980,11 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         proxies = await get_all_proxies_from_db()
         proxy_count = len(proxies)
         
+        interval_str = await redis_client.get("settings:auto_refresh_interval")
+        interval = int(interval_str) if (interval_str and interval_str.isdigit()) else 43200
+        auto_ref_str = f"هر {interval // 3600} ساعت 🟢" if interval > 0 else "غیرفعال 🔴"
+        last_run = await redis_client.get("settings:last_auto_refresh") or "ثبت نشده"
+
         maint = await redis_client.get("settings:maintenance")
         status = "غیرفعال 🔴" if maint == "1" else "فعال 🟢"
         
@@ -1679,6 +1994,8 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 <b>لینک‌های دائمی فعال:</b> <code>{len(link_keys)}</code>\n"
             f"✅ <b>کاربران تاییدشده:</b> <code>{auth_users}</code>\n"
             f"🌐 <b>تعداد پروکسی‌ها:</b> <code>{proxy_count}</code>\n"
+            f"⏱ <b>چرخش خودکار توکن‌ها:</b> {auto_ref_str}\n"
+            f"🕒 <b>آخرین نوسازی:</b> <code>{last_run}</code>\n"
             f"♾ <b>وضعیت انقضای لینک‌ها:</b> دائمی (بدون انقضا)\n"
             f"🤖 <b>وضعیت ربات:</b> {status}"
         )
@@ -1717,7 +2034,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc_keys:
             await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
             return
-        asyncio.create_task(process_refresh_and_revive_all(context.bot, user_id, acc_keys))
+        asyncio.create_task(process_refresh_and_revive_all(context.bot, user_id, acc_keys, is_auto_cycle=False))
 
     elif data == "admin_confirm_delete_dead":
         dead_phones = await redis_client.smembers("temp:unrecoverable_accounts")
@@ -1727,13 +2044,14 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         deleted_count = 0
         for phone in dead_phones:
-            await redis_client.delete(f"account:{phone}")
+            existed = await redis_client.delete(f"account:{phone}")
             active_url = await redis_client.get(f"phone_active_link:{phone}")
             if active_url and "/acc/" in active_url:
                 lid = active_url.split("/acc/")[-1].strip()
                 await redis_client.delete(f"acc_link:{lid}")
             await redis_client.delete(f"phone_active_link:{phone}")
-            deleted_count += 1
+            if existed:
+                deleted_count += 1
 
         await redis_client.delete("temp:unrecoverable_accounts")
         await query.edit_message_text(
@@ -1766,11 +2084,17 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_zip_to_link":
         context.user_data['admin_zip_action'] = 'zip_to_link'
-        await context.bot.send_message(chat_id=user_id, text="🔗 <b>عملیات استخراج لینک دائمی:</b>\nلطفاً فایل ZIP مربوطه را ارسال کنید.", parse_mode='HTML')
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="🔗 <b>عملیات تست سلامت و تبدیل فایل ZIP به لینک دائمی:</b>\n\n"
+                 "لطفاً یک یا چند فایل <code>.zip</code> ارسال کنید.\n"
+                 "🔹 ربات به صورت خودکار <code>Access</code> و <code>Refresh</code> هر اکانت را چک و نوسازی کرده و فقط برای اکانت‌های سالم لینک دائمی می‌سازد.",
+            parse_mode='HTML'
+        )
         
     elif data == "admin_zip_discount":
         context.user_data['admin_zip_action'] = 'zip_discount_check'
-        await context.bot.send_message(chat_id=user_id, text="🔍 <b>عملیات بررسی تخفیف:</b>\nلطفاً فایل ZIP مربوطه را ارسال کنید.", parse_mode='HTML')
+        await context.bot.send_message(chat_id=user_id, text="🔍 <b>عملیات بررسی تخفیف زیپ:</b>\nلطفاً یک یا چند فایل ZIP ارسال کنید.", parse_mode='HTML')
 
     elif data == "admin_export":
         acc_keys = await redis_client.keys("account:*")
@@ -1778,7 +2102,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
             return
         export_text = "لیست شماره‌های ثبت شده در سیستم:\n\n"
-        for key in acc_keys: export_text += f"{key.replace('account:', '')}\n"
+        for key in acc_keys: export_text += f"{clean_digits(key.replace('account:', ''))}\n"
         
         file_out = io.BytesIO(export_text.encode('utf-8'))
         await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Accounts_{int(time.time())}.txt", caption="📥 فایل دیتابیس (شماره‌ها) دریافت شد.")
@@ -1800,13 +2124,9 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             phone = "نامشخص"
             try:
                 data_json = json.loads(link_data)
-                origins = data_json.get("origins", [])
-                if origins:
-                    for item in origins[0].get("localStorage", []):
-                        if item.get("name") == "user":
-                            user_obj = json.loads(urllib.parse.unquote(item.get("value")))
-                            phone = user_obj.get("mobilePhone", "نامشخص")
-                            break
+                _, _, extr_p = extract_tokens_from_json_data(data_json)
+                if extr_p:
+                    phone = extr_p
             except Exception:
                 pass
             export_text += f"📱 شماره: {phone}\n🔗 لینک: {final_url}\n\n"
@@ -1820,10 +2140,10 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not acc_keys:
             await context.bot.send_message(chat_id=user_id, text="⚠️ دیتابیس سیستم خالی است.")
             return
-        await context.bot.send_message(chat_id=user_id, text="⏳ در حال استخراج توکن‌ها...")
+        await context.bot.send_message(chat_id=user_id, text="⏳ در حال استخراج آخرین توکن‌ها...")
         exported_data = {}
         for key in acc_keys:
-            phone = key.replace('account:', '')
+            phone = clean_digits(key.replace('account:', ''))
             tokens = await redis_client.hgetall(key)
             exported_data[phone] = {
                 "access_token": tokens.get("access_token", ""),
@@ -1831,7 +2151,7 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         json_data = json.dumps(exported_data, indent=4, ensure_ascii=False)
         file_out = io.BytesIO(json_data.encode('utf-8'))
-        await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Tokens_DB_{int(time.time())}.json", caption=f"🔑 فایل توکن‌های استخراج شده ({len(acc_keys)} شماره)")
+        await context.bot.send_document(chat_id=user_id, document=file_out, filename=f"Tokens_DB_{int(time.time())}.json", caption=f"🔑 فایل آخرین توکن‌های استخراج شده ({len(exported_data)} شماره)")
 
     elif data == "admin_clear":
         kb = [[InlineKeyboardButton("✅ تایید عملیات حذف کل دیتابیس", callback_data="admin_clear_confirm"), InlineKeyboardButton("❌ انصراف", callback_data="admin_panel")]]
@@ -2093,7 +2413,7 @@ async def resend_otp_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     otp_code = clean_digits(update.message.text)
-    phone = context.user_data.get('phone')
+    phone = clean_digits(context.user_data.get('phone', ''))
     chat_id = update.effective_chat.id
     msg = await update.message.reply_text("⏳ در حال بررسی کد تایید...")
     
@@ -2215,7 +2535,7 @@ async def verify_otp_and_check_name(update: Update, context: ContextTypes.DEFAUL
 
 async def generate_and_send_link(update: Update, context: ContextTypes.DEFAULT_TYPE, status_msg) -> int:
     auth_data = context.user_data.get('auth_data')
-    phone = context.user_data.get('phone', 'نامشخص')
+    phone = clean_digits(context.user_data.get('phone', 'نامشخص'))
     injection_json = format_for_injector(auth_data)
     link_id = str(uuid.uuid4())[:12]
     
@@ -2321,7 +2641,10 @@ async def main():
     await application.start()
     await application.updater.start_polling()
     
-    logging.info("System initialized successfully.")
+    # راه‌اندازی سرویس چرخش خودکار توکن‌ها در پس‌زمینه
+    asyncio.create_task(auto_refresh_background_task(application.bot))
+    
+    logging.info("System initialized successfully with Auto-Refresh background task.")
     stop_signal = asyncio.Event()
     await stop_signal.wait()
 
