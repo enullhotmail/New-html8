@@ -1,3 +1,4 @@
+```python
 import os
 import re
 import shutil
@@ -36,6 +37,10 @@ executor = ThreadPoolExecutor(max_workers=30)
 zip_queue_lock = asyncio.Lock()
 refresh_task_lock = asyncio.Lock()
 
+# متغیرهای مدیریت دریافت دسته‌ای (Batch) صدها فایل زیپ
+zip_batch_collection_lock = asyncio.Lock()
+zip_batch_update_tasks = {}
+
 USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36",
     "Mozilla/5.0 (Linux; Android 12; Pixel 6 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
@@ -50,6 +55,35 @@ def clean_digits(text: str) -> str:
     """تبدیل خودکار ارقام فارسی و عربی به انگلیسی"""
     if not text: return ""
     return text.translate(str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')).strip()
+
+def format_bytes(size_bytes: int) -> str:
+    """تبدیل بایت به فرمت خوانا (KB, MB, GB)"""
+    if not size_bytes or size_bytes <= 0:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+async def get_all_existing_phones_in_db() -> set:
+    """دریافت سریع تمامی شماره‌های موجود در دیتابیس برای جلوگیری از ساخت لینک تکراری"""
+    existing = set()
+    try:
+        acc_keys = await redis_client.keys("account:*")
+        for k in acc_keys:
+            p = clean_digits(k.replace("account:", ""))
+            if p:
+                existing.add(p)
+
+        active_keys = await redis_client.keys("phone_active_link:*")
+        for k in active_keys:
+            p = clean_digits(k.replace("phone_active_link:", ""))
+            if p:
+                existing.add(p)
+    except Exception as e:
+        logging.error(f"Error fetching existing phones from DB: {e}")
+    return existing
 
 def get_random_persian_name():
     return random.choice(FIRST_NAMES), random.choice(LAST_NAMES)
@@ -1229,8 +1263,366 @@ async def process_discounts_and_send_report(bot, chat_id, acc_keys):
         logging.error(f"Error sending log file: {e}")
 
 # ==========================================
-# پردازش فایل‌های زیپ (با تست سلامت Access و Refresh + صف خودکار چند فایل)
+# پردازش دسته‌ای (Batch) یک یا صدها فایل زیپ با جلوگیری از ساخت لینک تکراری و بروزرسانی زنده
 # ==========================================
+def get_zip_batch_keyboard(count: int):
+    kb = []
+    if count > 0:
+        kb.append([InlineKeyboardButton(f"🚀 شروع پردازش و تبدیل به لینک ({count} فایل زیپ)", callback_data="admin_start_zip_batch")])
+        kb.append([InlineKeyboardButton("🗑 پاک کردن لیست فایل‌های ارسالی", callback_data="admin_clear_zip_batch")])
+    kb.append([InlineKeyboardButton("❌ انصراف و بازگشت به پنل مدیریت", callback_data="admin_cancel_zip_batch")])
+    return InlineKeyboardMarkup(kb)
+
+def get_zip_batch_status_text(count: int) -> str:
+    if count == 0:
+        return (
+            "📦 <b>حالت دریافت دسته‌ای فایل‌های ZIP (تبدیل به لینک دائمی)</b>\n\n"
+            "لطفاً <b>یک یا چندصد فایل <code>.zip</code></b> را ارسال یا فوروارد کنید.\n"
+            "🔹 فایل‌های شما بدون محدودیت در صف ذخیره می‌شوند و تا زمانی که دکمه شروع را نزنید، پردازش آغاز نخواهد شد.\n"
+            "🔹 اگر شماره‌ای از قبل در دیتابیس وجود داشته باشد، برای جلوگیری از تکرار، لینک جدیدی برای آن ساخته نمی‌شود.\n"
+            "🔹 پس از اتمام ارسال همه فایل‌ها، روی دکمه <b>«🚀 شروع پردازش»</b> بزنید یا دستور /start_zip را ارسال کنید."
+        )
+    return (
+        f"📥 <b>دریافت فایل‌های زیپ در حال انجام است...</b>\n\n"
+        f"📦 تعداد فایل‌های زیپ دریافت‌شده تا این لحظه: <b>{count} فایل</b>\n\n"
+        f"💡 می‌توانید فایل‌های بیشتری بفرستید یا برای آغاز عملیات، دکمه زیر را لمس کنید (یا دستور /start_zip را بفرستید):"
+    )
+
+async def _delayed_update_batch_ui(bot, chat_id: int, user_data: dict):
+    """بروزرسانی هوشمند پیام وضعیت دریافت فایل‌ها با تاخیر کوتاه برای جلوگیری از Flood Limit تلگرام هنگام فوروارد صدها فایل"""
+    await asyncio.sleep(1.2)
+    if user_data.get('admin_state') != 'collecting_zips_for_link':
+        return
+    queue = user_data.get('zip_batch_queue', [])
+    count = len(queue)
+    msg_id = user_data.get('zip_batch_status_msg_id')
+    text = get_zip_batch_status_text(count)
+    kb = get_zip_batch_keyboard(count)
+
+    if msg_id:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, reply_markup=kb, parse_mode='HTML')
+            return
+        except Exception as e:
+            if "Message is not modified" in str(e):
+                return
+    try:
+        new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb, parse_mode='HTML')
+        user_data['zip_batch_status_msg_id'] = new_msg.message_id
+    except Exception as e:
+        logging.error(f"Error sending batch status UI: {e}")
+
+async def process_batch_zips_to_links(bot, chat_id: int, zip_items: list):
+    """پردازش سنگین، بهینه و موازی صدها فایل زیپ با نمایش زنده پیشرفت و عدم ساخت لینک برای شماره‌های تکراری دیتابیس"""
+    total_zips = len(zip_items)
+    ts = int(time.time())
+
+    live_msg = await bot.send_message(
+        chat_id=chat_id,
+        text=f"⏳ <b>عملیات پردازش دسته‌ای {total_zips} فایل زیپ در صف قرار گرفت...</b>\nلطفاً منتظر بمانید.",
+        parse_mode='HTML'
+    )
+
+    async with zip_queue_lock:
+        try:
+            await live_msg.edit_text(
+                f"🔍 <b>در حال استخراج اولیه شماره‌های موجود در دیتابیس برای جلوگیری از تکرار...</b>",
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        existing_phones = await get_all_existing_phones_in_db()
+        initial_db_count = len(existing_phones)
+
+        proxies_list = await get_all_proxies_from_db()
+        api = OkalaAPI(proxies_list=proxies_list)
+        loop = asyncio.get_running_loop()
+        sem = asyncio.Semaphore(25)
+        lock = asyncio.Lock()
+
+        overall_stats = {
+            "zips_done": 0,
+            "total_zips": total_zips,
+            "total_accounts_found": 0,
+            "processed_accounts": 0,
+            "refreshed": 0,
+            "access_only": 0,
+            "skipped_duplicate": 0,
+            "dead": 0,
+            "proxy_error": 0,
+            "zip_errors": 0
+        }
+
+        healthy_links = []
+        detail_logs = []
+        last_edit_time = [0.0]
+        start_time = time.time()
+
+        async def update_live_progress(current_zip_name: str, current_zip_idx: int, zip_acc_done: int, zip_acc_total: int, force: bool = False):
+            now = time.time()
+            if not force and (now - last_edit_time[0] < 2.5):
+                return
+            last_edit_time[0] = now
+
+            elapsed = int(now - start_time)
+            mins, secs = divmod(elapsed, 60)
+            time_str = f"{mins}:{secs:02d}"
+
+            zip_pct = int(( current_zip_idx / max(total_zips, 1) ) * 100)
+            bar_len = 12
+            filled = int(bar_len * zip_pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+
+            status_text = (
+                f"⚡ <b>پردازش زنده تبدیل دسته‌ای ZIP به لینک دائمی</b>\n"
+                f"<code>[{bar}] {zip_pct}%</code> | ⏱ زمان: <code>{time_str}</code>\n\n"
+                f"📦 <b>فایل‌های زیپ:</b> <code>{current_zip_idx}/{total_zips}</code>\n"
+                f"📂 <b>فایل فعلی:</b> <code>{html.escape(current_zip_name[:35])}</code> (<code>{zip_acc_done}/{zip_acc_total}</code>)\n"
+                f"👥 <b>کل اکانت‌های بررسی‌شده:</b> <code>{overall_stats['processed_accounts']}</code> از <code>{overall_stats['total_accounts_found']}</code>\n"
+                f"────────────────────\n"
+                f"🔗 <b>لینک‌های جدید ساخته‌شده:</b> <b><code>{len(healthy_links)}</code></b>\n"
+                f"  ├─ ♻️ نوسازی کامل (Refresh+Access): <code>{overall_stats['refreshed']}</code>\n"
+                f"  └─ 🟢 سالم با Access فعلی: <code>{overall_stats['access_only']}</code>\n"
+                f"⏭ <b>رد شده (تکراری و موجود در دیتابیس):</b> <code>{overall_stats['skipped_duplicate']}</code>\n"
+                f"💀 <b>رد شده (توکن باطل/منقضی):</b> <code>{overall_stats['dead']}</code>\n"
+                f"⚠️ <b>خطای شبکه/پروکسی:</b> <code>{overall_stats['proxy_error']}</code>"
+            )
+            try:
+                await live_msg.edit_text(status_text, parse_mode='HTML')
+            except Exception:
+                pass
+
+        for z_idx, z_item in enumerate(zip_items, 1):
+            orig_zip_name = z_item.get("file_name", f"file_{z_idx}.zip")
+            file_id = z_item.get("file_id")
+
+            await update_live_progress(orig_zip_name, z_idx - 1, 0, 0, force=(z_idx == 1))
+
+            try:
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    zip_path = os.path.join(temp_dir, f"batch_{z_idx}.zip")
+                    tg_file = await bot.get_file(file_id)
+                    await tg_file.download_to_drive(zip_path)
+
+                    extracted_dir = os.path.join(temp_dir, "extracted")
+                    await asyncio.to_thread(shutil.unpack_archive, zip_path, extracted_dir)
+
+                    json_files_paths = []
+                    for root, _, files in os.walk(extracted_dir):
+                        for file in files:
+                            if file.lower().endswith('.json'):
+                                json_files_paths.append(os.path.join(root, file))
+
+                    if not json_files_paths:
+                        async with lock:
+                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ فایل زیپ {orig_zip_name} فاقد هرگونه فایل JSON معتبر بود.\n")
+                            overall_stats["zips_done"] = z_idx
+                        continue
+
+                    zip_total_files = len(json_files_paths)
+                    overall_stats["total_accounts_found"] += zip_total_files
+                    zip_done_files = 0
+
+                    await update_live_progress(orig_zip_name, z_idx - 1, 0, zip_total_files)
+
+                    async def _zip_acc_worker(acc_idx, file_path):
+                        nonlocal zip_done_files
+                        filename = os.path.basename(file_path)
+                        async with sem:
+                            try:
+                                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                    file_content = f.read()
+                                    data = json.loads(file_content)
+
+                                acc_tok, ref_tok, extracted_phone = extract_tokens_from_json_data(data)
+                                phone = extracted_phone or clean_digits(filename.replace('.json', ''))
+
+                                # بررسی تکراری بودن شماره در دیتابیس یا در همین سری پردازش
+                                async with lock:
+                                    if phone and phone in existing_phones:
+                                        overall_stats["skipped_duplicate"] += 1
+                                        overall_stats["processed_accounts"] += 1
+                                        zip_done_files += 1
+                                        detail_logs.append(
+                                            f"[{time.strftime('%H:%M:%S')}] ⏭ {phone} ({orig_zip_name}) | از قبل در دیتابیس وجود دارد (لینک تکراری ساخته نشد)\n"
+                                        )
+                                        await update_live_progress(orig_zip_name, z_idx - 1, zip_done_files, zip_total_files)
+                                        return
+                                    if phone:
+                                        # رزرو فوری شماره تا اگر در فایل‌های بعدی هم بود تکراری پردازش نشود
+                                        existing_phones.add(phone)
+
+                                if not acc_tok and not ref_tok:
+                                    async with lock:
+                                        if phone:
+                                            existing_phones.discard(phone)
+                                        overall_stats["dead"] += 1
+                                        overall_stats["processed_accounts"] += 1
+                                        zip_done_files += 1
+                                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ {phone} ({orig_zip_name}/{filename}) | فاقد توکن معتبر\n")
+                                        await update_live_progress(orig_zip_name, z_idx - 1, zip_done_files, zip_total_files)
+                                    return
+
+                                res_type, final_acc, final_ref, st_code, raw_resp = await loop.run_in_executor(
+                                    executor, api.verify_and_renew_account, acc_tok, ref_tok, acc_idx
+                                )
+
+                                if res_type in ["refreshed", "access_only"] and final_acc:
+                                    await redis_client.hset(f"account:{phone}", mapping={
+                                        "access_token": final_acc,
+                                        "refresh_token": final_ref or ""
+                                    })
+
+                                    updated_json_data = update_tokens_in_data(data, acc_tok, final_acc, ref_tok, final_ref)
+                                    updated_content_str = json.dumps(updated_json_data, ensure_ascii=False)
+
+                                    link_id = str(uuid.uuid4())[:12]
+                                    await redis_client.set(f"acc_link:{link_id}", updated_content_str)
+                                    final_url = f"{WEB_DOMAIN}/acc/{link_id}"
+                                    await redis_client.set(f"phone_active_link:{phone}", final_url)
+
+                                    async with lock:
+                                        if res_type == "refreshed":
+                                            overall_stats["refreshed"] += 1
+                                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ {phone} ({orig_zip_name}) | نوسازی موفق و ساخت لینک: {final_url}\n")
+                                        else:
+                                            overall_stats["access_only"] += 1
+                                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🟢 {phone} ({orig_zip_name}) | Access سالم و ساخت لینک: {final_url}\n")
+                                        healthy_links.append({"phone": phone, "link": final_url, "zip": orig_zip_name})
+                                else:
+                                    async with lock:
+                                        if phone:
+                                            existing_phones.discard(phone)
+                                        if res_type == "unrecoverable":
+                                            overall_stats["dead"] += 1
+                                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 💀 {phone} ({orig_zip_name}) | توکن باطل (کد: {st_code}) — لینک ساخته نشد\n")
+                                        else:
+                                            overall_stats["proxy_error"] += 1
+                                            detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} ({orig_zip_name}) | خطای شبکه/پروکسی (کد: {st_code})\n")
+
+                                async with lock:
+                                    overall_stats["processed_accounts"] += 1
+                                    zip_done_files += 1
+                                    await update_live_progress(orig_zip_name, z_idx - 1, zip_done_files, zip_total_files)
+
+                            except Exception as e:
+                                async with lock:
+                                    overall_stats["dead"] += 1
+                                    overall_stats["processed_accounts"] += 1
+                                    zip_done_files += 1
+                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطا در خواندن {orig_zip_name}/{filename}: {e}\n")
+                                    await update_live_progress(orig_zip_name, z_idx - 1, zip_done_files, zip_total_files)
+
+                    await asyncio.gather(*[_zip_acc_worker(i, fp) for i, fp in enumerate(json_files_paths)])
+                    overall_stats["zips_done"] = z_idx
+                    await update_live_progress(orig_zip_name, z_idx, zip_total_files, zip_total_files)
+
+                    # نگه‌داشتن حداکثر ۵۰۰۰ خط آخر لاگ HTTP برای جلوگیری از پر شدن رم در پردازش‌های بسیار سنگین
+                    if len(api.request_logs) > 5000:
+                        api.request_logs = api.request_logs[-5000:]
+
+            except Exception as e:
+                overall_stats["zip_errors"] += 1
+                overall_stats["zips_done"] = z_idx
+                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطا در باز کردن فایل زیپ {orig_zip_name}: {e}\n")
+
+        await update_live_progress("اتمام تمامی فایل‌ها", total_zips, 0, 0, force=True)
+        try:
+            await live_msg.delete()
+        except Exception:
+            pass
+
+        elapsed_total = int(time.time() - start_time)
+        mins, secs = divmod(elapsed_total, 60)
+
+        summary_cap = (
+            f"✅ <b>عملیات پردازش دسته‌ای فایل‌های ZIP به پایان رسید.</b>\n\n"
+            f"📦 <b>تعداد فایل‌های زیپ پردازش‌شده:</b> <code>{total_zips}</code>\n"
+            f"👥 <b>کل اکانت‌های داخل زیپ‌ها:</b> <code>{overall_stats['total_accounts_found']}</code>\n"
+            f"🔗 <b>مجموع لینک‌های جدید ساخته‌شده:</b> <b><code>{len(healthy_links)}</code></b>\n"
+            f"  ├─ ♻️ نوسازی کامل (Refresh+Access): <code>{overall_stats['refreshed']}</code>\n"
+            f"  └─ 🟢 سالم با Access فعلی: <code>{overall_stats['access_only']}</code>\n"
+            f"⏭ <b>رد شده (تکراری — موجود در دیتابیس):</b> <code>{overall_stats['skipped_duplicate']}</code>\n"
+            f"💀 <b>رد شده (توکن باطل/سوخته):</b> <code>{overall_stats['dead']}</code>\n"
+            f"⚠️ <b>خطای شبکه/پروکسی:</b> <code>{overall_stats['proxy_error']}</code>\n"
+            f"⏱ <b>زمان کل پردازش:</b> <code>{mins} دقیقه و {secs} ثانیه</code>"
+        )
+
+        if healthy_links:
+            links_out_txt = (
+                f"🔗 لیست لینک‌های دائمی جدید استخراج‌شده از {total_zips} فایل زیپ (تعداد: {len(healthy_links)})\n"
+                f"شماره‌های تکراری موجود در دیتابیس ({overall_stats['skipped_duplicate']} مورد) نادیده گرفته شدند.\n"
+                + "=" * 60 + "\n\n"
+            )
+            for idx, item in enumerate(healthy_links, 1):
+                links_out_txt += f"{idx}. 📱 شماره: {item['phone']} | 📦 [{item['zip']}]\n🔗 {item['link']}\n\n"
+            file_out = io.BytesIO(links_out_txt.encode('utf-8'))
+            await bot.send_document(
+                chat_id=chat_id,
+                document=file_out,
+                filename=f"Batch_Valid_Zip_Links_{ts}.txt",
+                caption=summary_cap,
+                parse_mode='HTML'
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=summary_cap + "\n\n⚠️ هیچ لینک جدیدی ساخته نشد (اکانت‌ها یا تکراری بودند یا منقضی).",
+                parse_mode='HTML'
+            )
+
+        try:
+            full_zip_log = (
+                f"=== گزارش کامل پردازش دسته‌ای {total_zips} فایل زیپ | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+                f"اکانت‌های اولیه دیتابیس: {initial_db_count} | کل اکانت‌های زیپ: {overall_stats['total_accounts_found']} | "
+                f"لینک جدید: {len(healthy_links)} | تکراری رد شده: {overall_stats['skipped_duplicate']} | باطل: {overall_stats['dead']}\n"
+                + "=" * 65 + "\n\n"
+            )
+            full_zip_log += "".join(detail_logs)
+            full_zip_log += "\n\n=== لاگ درخواست‌های سرور (HTTP) ===\n"
+            full_zip_log += "".join(api.request_logs)
+            log_io = io.BytesIO(full_zip_log.encode('utf-8'))
+            await bot.send_document(
+                chat_id=chat_id,
+                document=log_io,
+                filename=f"Batch_Zip_Validation_Log_{ts}.txt",
+                caption=f"📄 لاگ کامل بررسی {total_zips} فایل زیپ"
+            )
+        except Exception as e:
+            logging.error(f"Error sending batch zip log: {e}")
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⚙️ بازگشت به پنل مدیریت:",
+            reply_markup=get_admin_keyboard()
+        )
+
+async def start_zip_batch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """فرمان متنی /start_zip برای شروع پردازش فایل‌های زیپ جمع‌آوری شده"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return
+    if context.user_data.get('admin_state') != 'collecting_zips_for_link':
+        await update.message.reply_text("⚠️ شما در حالت جمع‌آوری فایل زیپ نیستید. ابتدا از پنل مدیریت گزینه «🔗 تست و تبدیل زیپ به لینک» را انتخاب کنید.")
+        return
+    queue = list(context.user_data.get('zip_batch_queue', []))
+    if not queue:
+        await update.message.reply_text("⚠️ هنوز هیچ فایل زیپی ارسال نکرده‌اید! ابتدا فایل‌های `.zip` را بفرستید.")
+        return
+
+    context.user_data['admin_state'] = None
+    context.user_data['admin_zip_action'] = None
+    context.user_data['zip_batch_queue'] = []
+    status_msg_id = context.user_data.pop('zip_batch_status_msg_id', None)
+    if status_msg_id:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=status_msg_id)
+        except Exception:
+            pass
+
+    asyncio.create_task(process_batch_zips_to_links(context.bot, user_id, queue))
+
 async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id): return
@@ -1241,12 +1633,34 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     action = context.user_data.get('admin_zip_action', 'zip_to_link')
+
+    # اگر در حالت تبدیل زیپ به لینک هستیم، فایل‌ها را بدون محدودیت در صف جمع‌آوری کن تا ادمین دستور شروع بدهد
+    if action == 'zip_to_link' or context.user_data.get('admin_state') == 'collecting_zips_for_link':
+        context.user_data['admin_state'] = 'collecting_zips_for_link'
+        context.user_data['admin_zip_action'] = 'zip_to_link'
+        async with zip_batch_collection_lock:
+            if 'zip_batch_queue' not in context.user_data:
+                context.user_data['zip_batch_queue'] = []
+            context.user_data['zip_batch_queue'].append({
+                "file_id": update.message.document.file_id,
+                "file_name": orig_zip_name,
+                "file_size": update.message.document.file_size or 0
+            })
+
+        old_task = zip_batch_update_tasks.get(user_id)
+        if old_task and not old_task.done():
+            old_task.cancel()
+        zip_batch_update_tasks[user_id] = asyncio.create_task(
+            _delayed_update_batch_ui(context.bot, update.effective_chat.id, context.user_data)
+        )
+        return
+
     wait_msg = await update.message.reply_text(
-        f"📥 فایل <code>{html.escape(orig_zip_name)}</code> دریافت شد و در صف پردازش قرار گرفت...",
+        f"📥 فایل <code>{html.escape(orig_zip_name)}</code> دریافت شد و در صف بررسی تخفیف قرار گرفت...",
         parse_mode='HTML'
     )
 
-    # صف‌بندی خودکار در صورت ارسال همزمان چندین فایل زیپ
+    # صف‌بندی خودکار برای بررسی تخفیف زیپ
     async with zip_queue_lock:
         try:
             await wait_msg.edit_text(f"⏳ در حال دانلود و استخراج فایل <code>{html.escape(orig_zip_name)}</code>...", parse_mode='HTML')
@@ -1280,153 +1694,7 @@ async def handle_zip_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sem = asyncio.Semaphore(20)
             lock = asyncio.Lock()
 
-            if action == 'zip_to_link':
-                await wait_msg.edit_text(
-                    f"⚡ شروع بررسی سلامت Access و Refresh برای <b>{total_files}</b> اکانت داخل <code>{html.escape(orig_zip_name)}</code>...",
-                    parse_mode='HTML'
-                )
-
-                healthy_links = []
-                detail_logs = []
-                z_stats = {"refreshed": 0, "access_only": 0, "dead": 0, "proxy_error": 0}
-                done = 0
-                last_edit = 0
-
-                async def _zip_validate_worker(idx, file_path):
-                    nonlocal done, last_edit
-                    filename = os.path.basename(file_path)
-                    async with sem:
-                        try:
-                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                                file_content = f.read()
-                                data = json.loads(file_content)
-
-                            acc_tok, ref_tok, extracted_phone = extract_tokens_from_json_data(data)
-                            phone = extracted_phone or clean_digits(filename.replace('.json', ''))
-
-                            if not acc_tok and not ref_tok:
-                                async with lock:
-                                    z_stats["dead"] += 1
-                                    done += 1
-                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ {phone} ({filename}) | فاقد Access و Refresh معتبر در فایل\n")
-                                return
-
-                            res_type, final_acc, final_ref, st_code, raw_resp = await loop.run_in_executor(
-                                executor, api.verify_and_renew_account, acc_tok, ref_tok, idx
-                            )
-
-                            if res_type in ["refreshed", "access_only"] and final_acc:
-                                # ذخیره آخرین Access و Refresh در دیتابیس
-                                await redis_client.hset(f"account:{phone}", mapping={
-                                    "access_token": final_acc,
-                                    "refresh_token": final_ref or ""
-                                })
-
-                                # بروزرسانی توکن‌ها داخل ساختار JSON لینک
-                                updated_json_data = update_tokens_in_data(data, acc_tok, final_acc, ref_tok, final_ref)
-                                updated_content_str = json.dumps(updated_json_data, ensure_ascii=False)
-
-                                existing_url = await redis_client.get(f"phone_active_link:{phone}")
-                                if existing_url and '/acc/' in existing_url:
-                                    link_id = existing_url.split('/acc/')[-1].strip()
-                                else:
-                                    link_id = str(uuid.uuid4())[:12]
-
-                                await redis_client.set(f"acc_link:{link_id}", updated_content_str)
-                                final_url = f"{WEB_DOMAIN}/acc/{link_id}"
-                                await redis_client.set(f"phone_active_link:{phone}", final_url)
-
-                                async with lock:
-                                    if res_type == "refreshed":
-                                        z_stats["refreshed"] += 1
-                                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ✅ {phone} | رفرش موفق و لینک دائمی ساخته شد: {final_url}\n")
-                                    else:
-                                        z_stats["access_only"] += 1
-                                        detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 🟢 {phone} | Access سالم و لینک دائمی ساخته شد: {final_url}\n")
-                                    healthy_links.append({"phone": phone, "link": final_url})
-
-                            elif res_type == "unrecoverable":
-                                async with lock:
-                                    z_stats["dead"] += 1
-                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] 💀 {phone} | توکن‌ها باطل/منقضی (کد: {st_code}) — لینک ساخته نشد\n")
-                            else:
-                                async with lock:
-                                    z_stats["proxy_error"] += 1
-                                    detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ⚠️ {phone} | خطای شبکه/پروکسی (کد: {st_code})\n")
-
-                            async with lock:
-                                done += 1
-                                now = time.time()
-                                if (now - last_edit >= 2.0) or (done == total_files):
-                                    last_edit = now
-                                    try:
-                                        await wait_msg.edit_text(
-                                            f"📦 فایل: <code>{html.escape(orig_zip_name)}</code>\n"
-                                            f"📊 پیشرفت: <b>{done}/{total_files}</b>\n"
-                                            f"✅ سالم و نوسازی‌شده (Refresh+Access): <b>{z_stats['refreshed']}</b>\n"
-                                            f"🟢 سالم با Access فعلی: <b>{z_stats['access_only']}</b>\n"
-                                            f"💀 منقضی/باطل (رد شده): <b>{z_stats['dead']}</b>\n"
-                                            f"⚠️ خطای پروکسی: <b>{z_stats['proxy_error']}</b>",
-                                            parse_mode='HTML'
-                                        )
-                                    except Exception:
-                                        pass
-                        except Exception as e:
-                            async with lock:
-                                z_stats["dead"] += 1
-                                done += 1
-                                detail_logs.append(f"[{time.strftime('%H:%M:%S')}] ❌ خطای خواندن {filename}: {e}\n")
-
-                await asyncio.gather(*[_zip_validate_worker(i, fp) for i, fp in enumerate(json_files_paths)])
-
-                try:
-                    await wait_msg.delete()
-                except Exception:
-                    pass
-
-                summary_cap = (
-                    f"📦 <b>نتیجه بررسی فایل زیپ:</b> <code>{html.escape(orig_zip_name)}</code>\n\n"
-                    f"🔢 <b>کل فایل‌های بررسی‌شده:</b> <code>{total_files}</code>\n"
-                    f"✅ <b>نوسازی‌شده (Access + Refresh جدید):</b> <code>{z_stats['refreshed']}</code>\n"
-                    f"🟢 <b>سالم فقط با Access Token:</b> <code>{z_stats['access_only']}</code>\n"
-                    f"🔗 <b>مجموع لینک‌های دائمی ساخته‌شده:</b> <code>{len(healthy_links)}</code>\n"
-                    f"💀 <b>رد شده (توکن باطل):</b> <code>{z_stats['dead']}</code>\n"
-                    f"⚠️ <b>خطای شبکه/پروکسی:</b> <code>{z_stats['proxy_error']}</code>"
-                )
-
-                if healthy_links:
-                    links_out_txt = f"🔗 لیست لینک‌های دائمی سالم استخراج‌شده از {orig_zip_name} (تعداد: {len(healthy_links)})\n" + "=" * 55 + "\n\n"
-                    for idx, item in enumerate(healthy_links, 1):
-                        links_out_txt += f"{idx}. 📱 شماره: {item['phone']}\n🔗 {item['link']}\n\n"
-                    file_out = io.BytesIO(links_out_txt.encode('utf-8'))
-                    await context.bot.send_document(
-                        chat_id=user_id,
-                        document=file_out,
-                        filename=f"Valid_Zip_Links_{ts}.txt",
-                        caption=summary_cap,
-                        parse_mode='HTML'
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=summary_cap + "\n\n⚠️ هیچ اکانت سالمی در این فایل زیپ یافت نشد.",
-                        parse_mode='HTML'
-                    )
-
-                # ارسال لاگ کامل بررسی فایل زیپ
-                full_zip_log = f"=== لاگ بررسی سلامت فایل زیپ ({orig_zip_name}) | {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-                full_zip_log += "".join(detail_logs)
-                full_zip_log += "\n\n=== لاگ کامل درخواست‌های سرور ===\n"
-                full_zip_log += "".join(api.request_logs)
-                log_io = io.BytesIO(full_zip_log.encode('utf-8'))
-                await context.bot.send_document(
-                    chat_id=user_id,
-                    document=log_io,
-                    filename=f"Zip_Validation_Log_{ts}.txt",
-                    caption=f"📄 لاگ کامل بررسی توکن‌های فایل {orig_zip_name}"
-                )
-
-            elif action == 'zip_discount_check':
+            if action == 'zip_discount_check':
                 await wait_msg.edit_text(f"⚡ در حال بررسی موازی وضعیت تخفیف {total_files} فایل در <code>{html.escape(orig_zip_name)}</code>...", parse_mode='HTML')
                 discount_dir = os.path.join(temp_dir, "Discount_Accounts")
                 os.makedirs(os.path.join(discount_dir, 'accounts'), exist_ok=True)
@@ -1555,7 +1823,8 @@ def get_main_keyboard(is_admin_user, active_tag_name=None):
 
 def get_admin_keyboard():
     keyboard = [
-        [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("📋 گزارش لینک‌های کاربران", callback_data="admin_users_report")],
+        [InlineKeyboardButton("📊 آمار دیتابیس", callback_data="admin_stats"), InlineKeyboardButton("💾 حافظه Redis Railway", callback_data="admin_redis_memory")],
+        [InlineKeyboardButton("📋 گزارش لینک‌های کاربران", callback_data="admin_users_report")],
         [InlineKeyboardButton("♻️ نوسازی توکن‌ها و احیای دائمی لینک‌ها", callback_data="admin_refresh_and_revive")],
         [InlineKeyboardButton("⏱ تنظیم چرخش خودکار توکن‌ها", callback_data="admin_auto_refresh_menu")],
         [InlineKeyboardButton("🧹 استخراج اکانت‌های خام (بدون خرید و آدرس)", callback_data="admin_extract_raw")],
@@ -2000,6 +2269,52 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 <b>وضعیت ربات:</b> {status}"
         )
         await query.edit_message_text(text, reply_markup=get_admin_keyboard(), parse_mode='HTML')
+
+    elif data == "admin_redis_memory":
+        try:
+            mem_info = await redis_client.info("memory")
+            db_size = await redis_client.dbsize()
+
+            used_memory = int(mem_info.get("used_memory", 0))
+            used_memory_rss = int(mem_info.get("used_memory_rss", 0))
+            used_memory_peak = int(mem_info.get("used_memory_peak", 0))
+            maxmemory = int(mem_info.get("maxmemory", 0))
+            total_system_mem = int(mem_info.get("total_system_memory", 0))
+
+            # اگر در Railway سقف maxmemory روی خود Redis ست نشده باشد، امکان تنظیم از طریق متغیر محیطی REDIS_MAX_MEMORY_MB (پیش‌فرض ۵۰۰ مگابایت پلن پایه Railway) فراهم است
+            env_limit_mb = int(os.environ.get("REDIS_MAX_MEMORY_MB", "512"))
+            effective_limit = maxmemory if maxmemory > 0 else (env_limit_mb * 1024 * 1024)
+            limit_source = "تنظیمات Redis (maxmemory)" if maxmemory > 0 else f"پلن Railway ({env_limit_mb} MB)"
+
+            remaining_bytes = max(effective_limit - used_memory, 0)
+            usage_pct = min((used_memory / effective_limit) * 100, 100.0) if effective_limit > 0 else 0.0
+
+            bar_len = 14
+            filled = int(bar_len * usage_pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+
+            mem_text = (
+                "💾 <b>وضعیت حافظه دیتابیس Redis (Railway):</b>\n\n"
+                f"📊 <b>درصد مصرف:</b> <code>[{bar}] {usage_pct:.1f}%</code>\n\n"
+                f"🟢 <b>حافظه باقی‌مانده (آزاد):</b> <b><code>{format_bytes(remaining_bytes)}</code></b>\n"
+                f"🔴 <b>حافظه مصرف‌شده فعلی:</b> <code>{format_bytes(used_memory)}</code>\n"
+                f"📦 <b>کل ظرفیت مبنا:</b> <code>{format_bytes(effective_limit)}</code> ({limit_source})\n"
+                f"────────────────────\n"
+                f"📈 <b>بیشترین مصرف ثبت‌شده (Peak):</b> <code>{format_bytes(used_memory_peak)}</code>\n"
+                f"🖥 <b>مصرف واقعی رم (RSS):</b> <code>{format_bytes(used_memory_rss)}</code>\n"
+                f"🔑 <b>تعداد کل کلیدهای دیتابیس:</b> <code>{db_size:,}</code> کلید\n"
+            )
+            if total_system_mem > 0:
+                mem_text += f"🌐 <b>کل رم سرور میزبان:</b> <code>{format_bytes(total_system_mem)}</code>\n"
+
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 بروزرسانی وضعیت حافظه", callback_data="admin_redis_memory")],
+                [InlineKeyboardButton("🔙 بازگشت به پنل مدیریت", callback_data="admin_panel")]
+            ])
+            await query.edit_message_text(mem_text, reply_markup=kb, parse_mode='HTML')
+        except Exception as e:
+            logging.error(f"Error fetching redis memory info: {e}")
+            await context.bot.send_message(chat_id=user_id, text=f"❌ خطا در دریافت اطلاعات حافظه Redis:\n<code>{html.escape(str(e))}</code>", parse_mode='HTML')
         
     elif data == "admin_users_report":
         raw_logs = await redis_client.lrange("global_link_logs", 0, -1)
@@ -2084,15 +2399,47 @@ async def core_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "admin_zip_to_link":
         context.user_data['admin_zip_action'] = 'zip_to_link'
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="🔗 <b>عملیات تست سلامت و تبدیل فایل ZIP به لینک دائمی:</b>\n\n"
-                 "لطفاً یک یا چند فایل <code>.zip</code> ارسال کنید.\n"
-                 "🔹 ربات به صورت خودکار <code>Access</code> و <code>Refresh</code> هر اکانت را چک و نوسازی کرده و فقط برای اکانت‌های سالم لینک دائمی می‌سازد.",
+        context.user_data['admin_state'] = 'collecting_zips_for_link'
+        context.user_data['zip_batch_queue'] = []
+        status_msg = await query.edit_message_text(
+            text=get_zip_batch_status_text(0),
+            reply_markup=get_zip_batch_keyboard(0),
             parse_mode='HTML'
         )
+        context.user_data['zip_batch_status_msg_id'] = status_msg.message_id
+
+    elif data == "admin_start_zip_batch":
+        queue = list(context.user_data.get('zip_batch_queue', []))
+        if not queue:
+            await query.answer("⚠️ هنوز هیچ فایل زیپی ارسال نکرده‌اید!", show_alert=True)
+            return
+        context.user_data['admin_state'] = None
+        context.user_data['admin_zip_action'] = None
+        context.user_data['zip_batch_queue'] = []
+        context.user_data.pop('zip_batch_status_msg_id', None)
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+        asyncio.create_task(process_batch_zips_to_links(context.bot, user_id, queue))
+
+    elif data == "admin_clear_zip_batch":
+        context.user_data['zip_batch_queue'] = []
+        await query.edit_message_text(
+            text=get_zip_batch_status_text(0),
+            reply_markup=get_zip_batch_keyboard(0),
+            parse_mode='HTML'
+        )
+
+    elif data == "admin_cancel_zip_batch":
+        context.user_data['admin_state'] = None
+        context.user_data['admin_zip_action'] = None
+        context.user_data['zip_batch_queue'] = []
+        context.user_data.pop('zip_batch_status_msg_id', None)
+        await query.edit_message_text("⚙️ <b>پنل مدیریت سیستم:</b>", reply_markup=get_admin_keyboard(), parse_mode='HTML')
         
     elif data == "admin_zip_discount":
+        context.user_data['admin_state'] = None
         context.user_data['admin_zip_action'] = 'zip_discount_check'
         await context.bot.send_message(chat_id=user_id, text="🔍 <b>عملیات بررسی تخفیف زیپ:</b>\nلطفاً یک یا چند فایل ZIP ارسال کنید.", parse_mode='HTML')
 
@@ -2181,6 +2528,13 @@ async def handle_admin_text_document(update: Update, context: ContextTypes.DEFAU
     state = context.user_data.get('admin_state')
     if not state:
         return
+
+    # ۰. اگر ادمین در حالت جمع‌آوری فایل‌های زیپ است و متن «شروع» را ارسال کرد
+    if state == 'collecting_zips_for_link' and update.message and update.message.text:
+        txt = update.message.text.strip()
+        if txt in ["شروع", "start", "Start", "شروع پردازش"]:
+            await start_zip_batch_command(update, context)
+            return
 
     # ۱. دریافت و ذخیره پروکسی‌ها
     if state == 'waiting_for_proxy':
@@ -2632,6 +2986,7 @@ async def main():
     
     application.add_handler(CommandHandler('start', show_main_menu))
     application.add_handler(CommandHandler('admin', admin_command))
+    application.add_handler(CommandHandler('start_zip', start_zip_batch_command))
     
     application.add_handler(MessageHandler(filters.Document.FileExtension("zip"), handle_zip_upload))
     application.add_handler(CallbackQueryHandler(core_callback, pattern="^admin_|^auth_|^request_bot_access$|^main_menu$\vert{}^admin_panel$|^finish_link_creation$\vert{}^my_tags$|^show_tag_"))
@@ -2653,3 +3008,4 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+```
